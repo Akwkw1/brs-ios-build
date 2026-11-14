@@ -322,6 +322,10 @@ static const struct tab {
 /* systemcheck://gpu, systemcheck://gpu/run */
 - (BOOL)application:(UIApplication *)application openURL:(NSURL *)url options:(NSDictionary *)options
 {
+	if ([url.host isEqualToString:@"effects"] && [url.path isEqualToString:@"/photos"]) {
+		effects_photos();       /* (a helper for photo pickers' tests: no tab to show) */
+		return YES;
+	}
 	for (NSUInteger i = 0; i < TAB_COUNT; i++) {
 		if ([url.host isEqualToString:tabs[i].name]) {
 			self.tabs.selectedIndex = i;

@@ -17,6 +17,7 @@ void metal_run(void);
 void video_run(void);
 void gps_run(void);                             /* a DEMO sky: made-up satellites, to check the drawing */
 void effects_run(void);                         /* every scenario, 10 s each */
+void effects_photos(void);                      /* systemcheck://effects/photos: 60 made-up photos into the library */
 
 /* Whether the GPU tab has made an SKView / SCNView in this process (gpu.m sets them). SpriteKit and SceneKit pick
    OpenGL ES or Metal once a process, so the Metal tab's spritekit and scenekit tests mean something only before. */

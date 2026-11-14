@@ -67,7 +67,11 @@
 	<true/>
 	<key>UIFileSharingEnabled</key>
 	<true/>
-	<key>NSCameraUsageDescription</key>
+	<key>NSPhotoLibraryUsageDescription</key>
+<string>The Effects tab scrolls the library's thumbnails, as a photo picker does.</string>
+<key>NSPhotoLibraryAddUsageDescription</key>
+<string>The Effects tab can add test photos for a photo picker to scroll.</string>
+<key>NSCameraUsageDescription</key>
 	<string>System Check lists the cameras and shows whether it may use them. It takes no picture.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>System Check shows the microphone's level. Nothing is kept: the recording is deleted as it goes.</string>

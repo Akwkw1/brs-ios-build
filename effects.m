@@ -11,7 +11,9 @@
 // measured -- the app's display link (frames, late frames, the worst). The result lines ("effectscheck: ...") go to
 // the console and to Documents/effectscheck.log with the wall-clock time, so that the port's kernel log (the
 // framebuffer's five-second "frames in" lines) can be read against them. systemcheck://effects/run runs them all.
+#import <AVFoundation/AVFoundation.h>
 #import <Metal/Metal.h>
+#import <Photos/Photos.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 #include <fcntl.h>
@@ -169,6 +171,9 @@ static NSString *const kGlassShader = @
 @property (strong) id<MTLRenderPipelineState> pipeline;
 @property (strong) CAMetalLayer *metalLayer;
 @property (assign) CFTimeInterval metalStart;
+/* the photo-library and camera scenarios */
+@property (strong) PHCachingImageManager *imageManager;
+@property (strong) AVCaptureSession *capture;
 - (void)start;
 @end
 
@@ -179,6 +184,54 @@ effects_controller(void)
 {
 	g_effects = [EffectsController new];
 	return g_effects;
+}
+
+/*
+ * systemcheck://effects/photos: 60 made-up photos into the library (a photo picker -- Nagram's, the photo-grid
+ * scenario -- needs some to scroll; the port's library starts empty at every boot). Each a numbered gradient.
+ */
+void
+effects_photos(void)
+{
+	void (^add)(void) = ^{
+		[PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
+			for (int i = 0; i < 60; i++) {
+				UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+
+				fmt.scale = 1;
+				UIImage *img = [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(1200, 1600) format:fmt]
+				    imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+					CGFloat hue = (CGFloat)(i % 30) / 30;
+					CGFloat comps[8] = { 0 };
+					UIColor *a = [UIColor colorWithHue:hue saturation:0.7 brightness:0.9 alpha:1];
+					UIColor *b = [UIColor colorWithHue:fmod(hue + 0.4, 1) saturation:0.8 brightness:0.4 alpha:1];
+
+					[a getRed:&comps[0] green:&comps[1] blue:&comps[2] alpha:&comps[3]];
+					[b getRed:&comps[4] green:&comps[5] blue:&comps[6] alpha:&comps[7]];
+					CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+					CGGradientRef g = CGGradientCreateWithColorComponents(cs, comps, NULL, 2);
+
+					CGContextDrawLinearGradient(ctx.CGContext, g, CGPointZero, CGPointMake(1200, 1600), 0);
+					CGGradientRelease(g);
+					CGColorSpaceRelease(cs);
+					[[NSString stringWithFormat:@"TEST %02d", i] drawAtPoint:CGPointMake(80, 700)
+					    withAttributes:@{ NSFontAttributeName: [UIFont boldSystemFontOfSize:180],
+						NSForegroundColorAttributeName: UIColor.whiteColor }];
+				}];
+				[PHAssetChangeRequest creationRequestForAssetFromImage:img];
+			}
+		} completionHandler:^(BOOL ok, NSError *error) {
+			effects_log([NSString stringWithFormat:@"photos: 60 added: %@ %@", ok ? @"yes" : @"NO",
+			    error.localizedDescription ?: @""]);
+		}];
+	};
+
+	[PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus status) {
+		effects_log([NSString stringWithFormat:@"photos: access %ld", (long)status]);
+		if (status == PHAuthorizationStatusAuthorized || status == PHAuthorizationStatusLimited) {
+			add();
+		}
+	}];
 }
 
 void
@@ -205,6 +258,9 @@ static const struct scenario {
 	{ "spring-sheet", "a sheet on springs, the page under it scaled (no blur)" },
 	{ "spring-sheet-glass", "the same sheet with glass on it" },
 	{ "thumbnails", "120 thumbnails scrolling (a photo picker's grid)" },
+	{ "photo-grid", "the photo library's own thumbnails (PHCachingImageManager) scrolling" },
+	{ "camera-tile", "a live camera preview tile over the tiles (a photo picker's first cell)" },
+	{ "photo-grid-camera", "the library's thumbnails with the camera tile on them" },
 	{ "metal-glass", "the app's own Metal: a glass shader drawn every frame (refraction, 5x5 blur)" },
 };
 #define SCENARIOS (sizeof(scenarios) / sizeof(scenarios[0]))
@@ -372,6 +428,87 @@ static const struct scenario {
 	[grid addAnimation:scroll forKey:@"scroll"];
 }
 
+/* the library's newest photos (up to 120, again from the first when fewer) as a 4-column grid, scrolling */
+- (void)photoGridOn:(CALayer *)page
+{
+	CGRect b = page.bounds;
+	CGFloat side = b.size.width / 4, px = side * UIScreen.mainScreen.scale;
+	CALayer *grid = [CALayer layer];
+	PHFetchOptions *fo = [PHFetchOptions new];
+	PHImageRequestOptions *ro = [PHImageRequestOptions new];
+	PHFetchResult<PHAsset *> *assets;
+	NSUInteger n;
+
+	fo.sortDescriptors = @[ [NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO] ];
+	assets = [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeImage options:fo];
+	n = assets.count;
+	effects_log([NSString stringWithFormat:@"photo-grid: %lu photos in the library (access %ld)", (unsigned long)n,
+	    (long)[PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite]]);
+	ro.deliveryMode = PHImageRequestOptionsDeliveryModeOpportunistic;
+	ro.resizeMode = PHImageRequestOptionsResizeModeFast;
+	self.imageManager = [PHCachingImageManager new];
+	grid.frame = CGRectMake(0, 0, b.size.width, side * 30);
+	grid.backgroundColor = UIColor.blackColor.CGColor;
+	for (NSUInteger i = 0; i < 120; i++) {
+		CALayer *t = [CALayer layer];
+
+		t.frame = CGRectMake((i % 4) * side + 1, (i / 4) * side + 1, side - 2, side - 2);
+		t.backgroundColor = UIColor.darkGrayColor.CGColor;
+		t.contentsGravity = kCAGravityResizeAspectFill;
+		t.masksToBounds = YES;
+		[grid addSublayer:t];
+		if (n > 0) {
+			[self.imageManager requestImageForAsset:assets[i % n] targetSize:CGSizeMake(px, px)
+			    contentMode:PHImageContentModeAspectFill options:ro resultHandler:^(UIImage *img, NSDictionary *info) {
+				dispatch_async(dispatch_get_main_queue(), ^{
+					t.contents = (__bridge id)img.CGImage;
+				});
+			}];
+		}
+	}
+	[page addSublayer:grid];
+	CABasicAnimation *scroll = [CABasicAnimation animationWithKeyPath:@"position.y"];
+
+	scroll.fromValue = @(grid.position.y);
+	scroll.toValue = @(grid.position.y - (grid.bounds.size.height - b.size.height));
+	scroll.duration = 4.0;
+	scroll.autoreverses = YES;
+	scroll.repeatCount = HUGE_VALF;
+	[grid addAnimation:scroll forKey:@"scroll"];
+}
+
+/* a live preview of the back camera in FRAME (a photo picker's camera cell); NO when there is no camera to use */
+- (BOOL)cameraOn:(CALayer *)stage frame:(CGRect)frame
+{
+	AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+	NSError *error = nil;
+	AVCaptureDeviceInput *input = device ? [AVCaptureDeviceInput deviceInputWithDevice:device error:&error] : nil;
+
+	if (input == nil) {
+		effects_log([NSString stringWithFormat:@"camera: none to use (access %ld): %@",
+		    (long)[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo], error.localizedDescription ?: @""]);
+		return NO;
+	}
+	AVCaptureSession *session = [AVCaptureSession new];
+
+	if ([session canAddInput:input]) {
+		[session addInput:input];
+	}
+	AVCaptureVideoPreviewLayer *preview = [AVCaptureVideoPreviewLayer layerWithSession:session];
+
+	preview.frame = frame;
+	preview.videoGravity = AVLayerVideoGravityResizeAspectFill;
+	preview.cornerRadius = 10;
+	preview.masksToBounds = YES;
+	[stage addSublayer:preview];
+	self.capture = session;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		[session startRunning];
+		effects_log([NSString stringWithFormat:@"camera: running %@", session.running ? @"yes" : @"NO"]);
+	});
+	return YES;
+}
+
 - (BOOL)metalOn:(CALayer *)stage
 {
 	NSError *error = nil;
@@ -457,7 +594,7 @@ static const struct scenario {
 	page = [CALayer layer];
 	page.frame = b;
 	[stage addSublayer:page];
-	if (strcmp(s->name, "thumbnails") != 0 && strcmp(s->name, "metal-glass") != 0) {
+	if (strcmp(s->name, "thumbnails") != 0 && strcmp(s->name, "metal-glass") != 0 && strncmp(s->name, "photo-grid", 10) != 0) {
 		[page addSublayer:[self tilesIn:b]];
 	}
 	/* (the stage in the window first: a view added for the scenario -- the visual effect -- goes above it) */
@@ -516,6 +653,13 @@ static const struct scenario {
 		[self springSheetOn:stage page:page glass:YES];
 	} else if (strcmp(s->name, "thumbnails") == 0) {
 		[self thumbnailsOn:page];
+	} else if (strcmp(s->name, "photo-grid") == 0) {
+		[self photoGridOn:page];
+	} else if (strcmp(s->name, "camera-tile") == 0) {
+		ok = [self cameraOn:stage frame:CGRectMake(24, b.size.height * 0.55, b.size.width * 0.5, b.size.width * 0.5)];
+	} else if (strcmp(s->name, "photo-grid-camera") == 0) {
+		[self photoGridOn:page];
+		ok = [self cameraOn:stage frame:CGRectMake(1, b.size.height * 0.3, b.size.width / 4 - 2, b.size.width / 4 - 2)];
 	} else if (strcmp(s->name, "metal-glass") == 0) {
 		ok = [self metalOn:stage];
 	}
@@ -582,6 +726,9 @@ static const struct scenario {
 - (void)teardown
 {
 	[[self.view.window viewWithTag:4242] removeFromSuperview];
+	[self.capture stopRunning];
+	self.capture = nil;
+	self.imageManager = nil;
 	[self.stage removeFromSuperlayer];
 	self.stage = nil;
 	self.metalLayer = nil;
