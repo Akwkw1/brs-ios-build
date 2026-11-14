@@ -278,6 +278,7 @@ static const struct tab {
 	{ @"gps", @"GPS", @"location.circle", gps_controller, NO, gps_run },
 	{ @"motion", @"Motion", @"gyroscope", motion_controller, NO, NULL },
 	{ @"video", @"Video", @"play.rectangle", video_controller, NO, video_run },
+	{ @"effects", @"Effects", @"sparkles", effects_controller, YES, effects_run },
 };
 #define TAB_COUNT ((NSUInteger)(sizeof(tabs) / sizeof(tabs[0])))
 
