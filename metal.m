@@ -3034,6 +3034,237 @@ msaa_depth_round(id<MTLTexture> target, id<CAMetalDrawable> drawable, unsigned *
 	    "wrong%@", (unsigned long)W, (unsigned long)H, *wrong, sizeof(at) / sizeof(at[0]), seen];
 }
 
+/*
+ * msaa.chain / msaa.chain.screen: Flutter's frame as a chain in ONE command buffer -- an offscreen 4x pass resolved into
+ * a 256x256 texture (a layer: red left half, green right half), then a screen-size 4x pass (+ 4x Depth32Float_Stencil8)
+ * drawing 400 quads that each SAMPLE that layer, resolved into a texture or a drawable. Flutter's offscreen layers
+ * came out right on the K40 port while its on-screen pass, which samples them, was lost with hardware binning on
+ * (rounds b17-b20); nothing in msaa.many / msaa.depth read a texture written earlier in the same command buffer.
+ */
+static NSString *const kChainSource = @
+	"#include <metal_stdlib>\n"
+	"using namespace metal;\n"
+	"struct CVert { float4 pos; float2 uv; float2 pad; };\n"
+	"struct COut { float4 pos [[position]]; float2 uv; };\n"
+	"vertex COut c_vertex(uint vid [[vertex_id]], constant CVert *v [[buffer(0)]]) {\n"
+	"  COut o; o.pos = v[vid].pos; o.uv = v[vid].uv; return o;\n"
+	"}\n"
+	"fragment float4 c_sample(COut in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+	"  return t.sample(s, in.uv);\n"
+	"}\n"
+	"fragment float4 c_halves(COut in [[stage_in]]) {\n"
+	"  return in.uv.x < 0.5 ? float4(1, 0, 0, 1) : float4(0, 1, 0, 1);\n"
+	"}\n";
+
+struct chain_vert {
+	float pos[4];
+	float uv[2];
+	float pad[2];
+};
+
+static NSString *
+msaa_chain_round(id<MTLTexture> target, id<CAMetalDrawable> drawable, unsigned *wrong)
+{
+	NSUInteger W = target.width, H = target.height;
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	MTLTextureDescriptor *d;
+	id<MTLTexture> layer, layerSamples, samples, depth;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	id<MTLRenderPipelineState> halves, sampled;
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	id<MTLSamplerState> nearest;
+
+	*wrong = 0;
+	if ((lib = [g_device newLibraryWithSource:kChainSource options:nil error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no library: %@", error.localizedDescription];
+	}
+	d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:256 height:256 mipmapped:NO];
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	d.storageMode = MTLStorageModePrivate;
+	layer = [g_device newTextureWithDescriptor:d];
+	d.textureType = MTLTextureType2DMultisample;
+	d.sampleCount = 4;
+	d.usage = MTLTextureUsageRenderTarget;
+	d.storageMode = MTLStorageModeMemoryless;
+	layerSamples = [g_device newTextureWithDescriptor:d];
+	d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H mipmapped:NO];
+	d.textureType = MTLTextureType2DMultisample;
+	d.sampleCount = 4;
+	d.usage = MTLTextureUsageRenderTarget;
+	d.storageMode = MTLStorageModeMemoryless;
+	samples = [g_device newTextureWithDescriptor:d];
+	d.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	depth = [g_device newTextureWithDescriptor:d];
+	if (layer == nil || layerSamples == nil || samples == nil || depth == nil) {
+		return @"no textures for the chain";
+	}
+	p.vertexFunction = [lib newFunctionWithName:@"c_vertex"];
+	p.fragmentFunction = [lib newFunctionWithName:@"c_halves"];
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	p.rasterSampleCount = 4;
+	if ((halves = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no layer pipeline: %@", error.localizedDescription];
+	}
+	p.fragmentFunction = [lib newFunctionWithName:@"c_sample"];
+	p.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	p.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	p.colorAttachments[0].blendingEnabled = YES;
+	p.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+	p.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	p.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	p.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	if ((sampled = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no sampling pipeline: %@", error.localizedDescription];
+	}
+	sd.minFilter = MTLSamplerMinMagFilterNearest;
+	sd.magFilter = MTLSamplerMinMagFilterNearest;
+	nearest = [g_device newSamplerStateWithDescriptor:sd];
+
+	id<MTLCommandBuffer> buffer = [[g_device newCommandQueue] commandBuffer];
+	/* the layer: a full quad, red where u < 0.5, green beyond */
+	MTLRenderPassDescriptor *lp = [MTLRenderPassDescriptor renderPassDescriptor];
+
+	lp.colorAttachments[0].texture = layerSamples;
+	lp.colorAttachments[0].resolveTexture = layer;
+	lp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	lp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+	lp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+	id<MTLRenderCommandEncoder> e = [buffer renderCommandEncoderWithDescriptor:lp];
+	const struct chain_vert full[6] = { { { -1, -1, 0, 1 }, { 0, 1 } }, { { 1, -1, 0, 1 }, { 1, 1 } },
+	    { { -1, 1, 0, 1 }, { 0, 0 } }, { { 1, -1, 0, 1 }, { 1, 1 } }, { { 1, 1, 0, 1 }, { 1, 0 } },
+	    { { -1, 1, 0, 1 }, { 0, 0 } } };
+
+	[e setRenderPipelineState:halves];
+	[e setVertexBytes:full length:sizeof(full) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[e endEncoding];
+
+	/* the screen: 400 quads, each sampling the layer -- a quad in the left half of the grid the layer's left (red),
+	 * in the right half its right (green) */
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+	pass.colorAttachments[0].texture = samples;
+	pass.colorAttachments[0].resolveTexture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	pass.depthAttachment.texture = depth;
+	pass.depthAttachment.loadAction = MTLLoadActionClear;
+	pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+	pass.stencilAttachment.texture = depth;
+	pass.stencilAttachment.loadAction = MTLLoadActionClear;
+	pass.stencilAttachment.storeAction = MTLStoreActionDontCare;
+	e = [buffer renderCommandEncoderWithDescriptor:pass];
+	[e setRenderPipelineState:sampled];
+	[e setFragmentTexture:layer atIndex:0];
+	[e setFragmentSamplerState:nearest atIndex:0];
+	for (unsigned gy = 0; gy < 20; gy++) {
+		for (unsigned gx = 0; gx < 20; gx++) {
+			float x0 = -1 + gx * 0.1f + 0.01f, x1 = -1 + (gx + 1) * 0.1f - 0.01f;
+			float y0 = -1 + gy * 0.1f + 0.01f, y1 = -1 + (gy + 1) * 0.1f - 0.01f;
+			float u = gx < 10 ? 0.25f : 0.75f;
+			const struct chain_vert q[6] = { { { x0, y0, 0, 1 }, { u, 0.5f } }, { { x1, y0, 0, 1 }, { u, 0.5f } },
+			    { { x0, y1, 0, 1 }, { u, 0.5f } }, { { x1, y0, 0, 1 }, { u, 0.5f } }, { { x1, y1, 0, 1 }, { u, 0.5f } },
+			    { { x0, y1, 0, 1 }, { u, 0.5f } } };
+
+			[e setVertexBytes:q length:sizeof(q) atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+		}
+	}
+	[e endEncoding];
+	if (drawable != nil) {
+		[buffer presentDrawable:drawable];
+	}
+	[buffer commit];
+	[buffer waitUntilCompleted];
+	if (buffer.status != MTLCommandBufferStatusCompleted) {
+		return [NSString stringWithFormat:@"the command buffer ended with status %ld: %@", (long)buffer.status,
+		    buffer.error.localizedDescription];
+	}
+	static const unsigned at[][2] = { { 2, 3 }, { 7, 15 }, { 9, 0 }, { 0, 19 }, { 12, 5 }, { 17, 18 }, { 10, 10 }, { 15, 1 } };
+	NSMutableString *seen = [NSMutableString string];
+
+	for (unsigned k = 0; k < sizeof(at) / sizeof(at[0]); k++) {
+		unsigned gx = at[k][0], gy = at[k][1];
+		NSUInteger px = (NSUInteger)(((-1 + (gx + 0.5) * 0.1) + 1) / 2 * W);
+		NSUInteger py = (NSUInteger)((1 - (-1 + (gy + 0.5) * 0.1)) / 2 * H);
+		unsigned char b[4];
+		unsigned wr = gx < 10 ? 255 : 0, wg = gx < 10 ? 0 : 255;
+
+		[target getBytes:b bytesPerRow:4 fromRegion:MTLRegionMake2D(px, py, 1, 1) mipmapLevel:0];
+		if (!px_near(b, 0, wg, wr, 255, 3)) {
+			(*wrong)++;
+			[seen appendFormat:@" (%u,%u) B G R A %u %u %u %u, want 0 %u %u 255;", gx, gy, b[0], b[1], b[2], b[3], wg, wr];
+		}
+	}
+	return [NSString stringWithFormat:@"%lux%lu, a 4x layer then 400 draws sampling it, one command buffer: %u of %zu "
+	    "points wrong%@", (unsigned long)W, (unsigned long)H, *wrong, sizeof(at) / sizeof(at[0]), seen];
+}
+
+static void
+test_metal_msaa_chain(MetalTest *t)
+{
+	CGSize size = UIScreen.mainScreen.nativeBounds.size;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	    width:(NSUInteger)size.width height:(NSUInteger)size.height mipmapped:NO];
+	id<MTLTexture> target;
+	unsigned wrong;
+	NSString *said;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	if ((target = [g_device newTextureWithDescriptor:d]) == nil) {
+		[t fail:@"no %gx%g texture", size.width, size.height];
+		return;
+	}
+	said = msaa_chain_round(target, nil, &wrong);
+	if (wrong == 0 && [said hasPrefix:@"no "] == NO && [said hasPrefix:@"the command"] == NO) {
+		[t pass:@"into a texture: %@", said];
+	} else {
+		[t fail:@"into a texture: %@", said];
+	}
+}
+
+static void
+test_metal_msaa_chain_screen(MetalTest *t)
+{
+	CAMetalLayer *layer;
+	id<CAMetalDrawable> drawable;
+	unsigned wrong;
+	NSString *said;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if (g_stage == nil) {
+		[t skip:@"nowhere on the screen to put a layer"];
+		return;
+	}
+	layer = [CAMetalLayer layer];
+	layer.device = g_device;
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	layer.framebufferOnly = NO;
+	layer.frame = g_stage.bounds;
+	layer.contentsScale = UIScreen.mainScreen.scale;
+	layer.drawableSize = UIScreen.mainScreen.nativeBounds.size;
+	[g_stage.layer addSublayer:layer];
+	if ((drawable = [layer nextDrawable]) == nil) {
+		[t fail:@"the layer gave no drawable"];
+		[layer removeFromSuperlayer];
+		return;
+	}
+	said = msaa_chain_round(drawable.texture, drawable, &wrong);
+	if (wrong == 0 && [said hasPrefix:@"no "] == NO && [said hasPrefix:@"the command"] == NO) {
+		[t pass:@"into a drawable: %@", said];
+	} else {
+		[t fail:@"into a drawable: %@", said];
+	}
+	[layer removeFromSuperlayer];
+}
+
 static void
 test_metal_msaa_depth(MetalTest *t)
 {
@@ -7957,6 +8188,8 @@ static const struct {
 	{ "metal.msaa.many.screen", test_metal_msaa_many_screen },
 	{ "metal.msaa.depth", test_metal_msaa_depth },
 	{ "metal.msaa.depth.screen", test_metal_msaa_depth_screen },
+	{ "metal.msaa.chain", test_metal_msaa_chain },
+	{ "metal.msaa.chain.screen", test_metal_msaa_chain_screen },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
