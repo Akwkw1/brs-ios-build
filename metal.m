@@ -2414,6 +2414,90 @@ test_metal_msaa(MetalTest *t)
 	}
 }
 
+/*
+ * msaa.memoryless: the 4x attachment MTLStorageModeMemoryless, as an engine on an Apple-family device makes it
+ * (Flutter's Impeller): (a) a triangle resolved -- edges grey, inside white, outside black, as metal.msaa; (b) a pass
+ * that only clears it and resolves -- the resolve texture the clear colour everywhere.
+ */
+static void
+test_metal_msaa_memoryless(MetalTest *t)
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	    width:SIDE height:SIDE mipmapped:NO];
+	id<MTLTexture> samples;
+	NSString *problem = nil;
+	unsigned wrong = 0, between = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	d.textureType = MTLTextureType2DMultisample;
+	d.sampleCount = 4;
+	d.usage = MTLTextureUsageRenderTarget;
+	d.storageMode = MTLStorageModeMemoryless;
+	if ((samples = [g_device newTextureWithDescriptor:d]) == nil) {
+		[t fail:@"no memoryless 4x multisample texture"];
+		return;
+	}
+	if (!render_ours(@"v_colored", @"f_color", MTLClearColorMake(0, 0, 0, 1), ^(MTLRenderPipelineDescriptor *p) {
+		    p.rasterSampleCount = 4;
+	    }, ^(MTLRenderPassDescriptor *pass) {
+		    pass.colorAttachments[0].resolveTexture = pass.colorAttachments[0].texture;
+		    pass.colorAttachments[0].texture = samples;
+		    pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+	    }, ^(id<MTLRenderCommandEncoder> e) {
+		    const float v[3][8] = {
+			    { -1, -1, 0, 1, 1, 1, 1, 1 }, { 1, -1, 0, 1, 1, 1, 1, 1 }, { -1, 1, 0, 1, 1, 1, 1, 1 },
+		    };
+
+		    [e setVertexBytes:v length:sizeof(v) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	    }, px, &problem)) {
+		[t fail:@"drawn: %@", problem];
+		return;
+	}
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			float cx = (x + 0.5f) / SIDE * 2 - 1, cy = 1 - (y + 0.5f) / SIDE * 2;
+			const unsigned char *p = px + (y * SIDE + x) * 4;
+
+			if (fabsf(cx + cy) < 2.0f / SIDE) {
+				between += p[0] > 16 && p[0] < 240;
+				continue;
+			}
+			wrong += !px_near(p, cx + cy < 0 ? 255 : 0, cx + cy < 0 ? 255 : 0, cx + cy < 0 ? 255 : 0, 255, 1);
+		}
+	}
+	if (wrong != 0 || between == 0) {
+		[t fail:@"drawn: %u pixels wrong, %u edge pixels grey; %@, %@", wrong, between, px_text(px, 8, SIDE - 8),
+		    px_text(px, SIDE - 8, 8)];
+		return;
+	}
+	/* (b) a pass of the same memoryless attachment that clears, draws nothing and resolves */
+	if (!render_ours(@"v_colored", @"f_color", MTLClearColorMake(0.0, 0.5, 1.0, 1), ^(MTLRenderPipelineDescriptor *p) {
+		    p.rasterSampleCount = 4;
+	    }, ^(MTLRenderPassDescriptor *pass) {
+		    pass.colorAttachments[0].resolveTexture = pass.colorAttachments[0].texture;
+		    pass.colorAttachments[0].texture = samples;
+		    pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+	    }, ^(id<MTLRenderCommandEncoder> e) {
+		    (void)e;
+	    }, px, &problem)) {
+		[t fail:@"cleared: %@", problem];
+		return;
+	}
+	wrong = 0;
+	for (unsigned i = 0; i < SIDE * SIDE; i++) {
+		wrong += !px_near(px + i * 4, 255, 128, 0, 255, 2);
+	}
+	if (wrong == 0) {
+		[t pass:@"resolved from a memoryless 4x attachment: %u edge pixels grey; a clear-only pass resolved its colour", between];
+	} else {
+		[t fail:@"cleared: %u pixels not the clear colour; %@", wrong, px_text(px, SIDE / 2, SIDE / 2)];
+	}
+}
+
 /* one compute dispatch of our kernel `name` over n threads in groups of `group`; `bind` sets its arguments */
 static BOOL
 dispatch_ours(id<MTLFunction> function, NSUInteger n, NSUInteger group, void (^bind)(id<MTLComputeCommandEncoder>),
@@ -7204,6 +7288,7 @@ static const struct {
 	{ "metal.setbytes.many", test_metal_setbytes_many },
 	{ "metal.simd", test_metal_simd },
 	{ "metal.occlusion", test_metal_occlusion },
+	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
