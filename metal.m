@@ -2498,6 +2498,109 @@ test_metal_msaa_memoryless(MetalTest *t)
 	}
 }
 
+/*
+ * msaa.drawable: a 4x pass resolved INTO a CAMetalLayer's drawable (an IOSurface), as Flutter's Impeller draws its
+ * screen -- a white lower-left triangle on black, presented, then the drawable read back at a point inside, one
+ * outside and one on the diagonal (grey: multisampled). On the K40 port a resolve in the GPU's tiles into such a
+ * surface left Flutter's screen black (11-16); this says whether the application's own view of it is right.
+ */
+static void
+test_metal_msaa_drawable(MetalTest *t)
+{
+	CAMetalLayer *layer;
+	id<CAMetalDrawable> drawable;
+	id<MTLTexture> samples;
+	id<MTLRenderPipelineState> pipeline;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	NSError *error = nil;
+	unsigned char in[4], out[4], edge[4];
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if (g_stage == nil) {
+		[t skip:@"nowhere on the screen to put a layer"];
+		return;
+	}
+	layer = [CAMetalLayer layer];
+	layer.device = g_device;
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	layer.framebufferOnly = NO;
+	layer.frame = g_stage.bounds;
+	layer.contentsScale = UIScreen.mainScreen.scale;
+	layer.drawableSize = CGSizeMake(g_stage.bounds.size.width * layer.contentsScale,
+	    g_stage.bounds.size.height * layer.contentsScale);
+	[g_stage.layer addSublayer:layer];
+	if ((drawable = [layer nextDrawable]) == nil) {
+		[t fail:@"the layer gave no drawable"];
+		return;
+	}
+	NSUInteger W = drawable.texture.width, H = drawable.texture.height;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W
+	    height:H mipmapped:NO];
+
+	d.textureType = MTLTextureType2DMultisample;
+	d.sampleCount = 4;
+	d.usage = MTLTextureUsageRenderTarget;
+	d.storageMode = MTLStorageModePrivate;
+	p.vertexFunction = [g_ours newFunctionWithName:@"v_colored"];
+	p.fragmentFunction = [g_ours newFunctionWithName:@"f_color"];
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	p.rasterSampleCount = 4;
+	if ((samples = [g_device newTextureWithDescriptor:d]) == nil ||
+	    (pipeline = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		[t fail:@"%@", samples == nil ? @"no 4x texture of the drawable's size" :
+		    [NSString stringWithFormat:@"no pipeline: %@", error.localizedDescription]];
+		[layer removeFromSuperlayer];
+		return;
+	}
+	id<MTLCommandBuffer> buffer = [[g_device newCommandQueue] commandBuffer];
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+	pass.colorAttachments[0].texture = samples;
+	pass.colorAttachments[0].resolveTexture = drawable.texture;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	id<MTLRenderCommandEncoder> e = [buffer renderCommandEncoderWithDescriptor:pass];
+	const float v[3][8] = { { -1, -1, 0, 1, 1, 1, 1, 1 }, { 1, -1, 0, 1, 1, 1, 1, 1 }, { -1, 1, 0, 1, 1, 1, 1, 1 } };
+
+	[e setRenderPipelineState:pipeline];
+	[e setVertexBytes:v length:sizeof(v) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[e endEncoding];
+	[buffer presentDrawable:drawable];
+	[buffer commit];
+	[buffer waitUntilCompleted];
+	if (buffer.status != MTLCommandBufferStatusCompleted) {
+		[t fail:@"the command buffer ended with status %ld: %@", (long)buffer.status, buffer.error.localizedDescription];
+		[layer removeFromSuperlayer];
+		return;
+	}
+	/* inside: a quarter from the lower left; outside: a quarter from the upper right; the diagonal: the middle row's
+	 * pixel where x + y crosses it (rows from the top) */
+	[drawable.texture getBytes:in bytesPerRow:4 fromRegion:MTLRegionMake2D(W / 4, H * 3 / 4, 1, 1) mipmapLevel:0];
+	[drawable.texture getBytes:out bytesPerRow:4 fromRegion:MTLRegionMake2D(W * 3 / 4, H / 4, 1, 1) mipmapLevel:0];
+	unsigned grey = 0;
+
+	for (NSUInteger x = 0; x < W && grey == 0; x++) {
+		NSUInteger y = H - 1 - x * H / W;       /* (the triangle's edge from (0,H) to (W,0)) */
+
+		[drawable.texture getBytes:edge bytesPerRow:4 fromRegion:MTLRegionMake2D(x, MIN(y, H - 1), 1, 1) mipmapLevel:0];
+		grey += edge[0] > 16 && edge[0] < 240;
+	}
+	BOOL ok = px_near(in, 255, 255, 255, 255, 1) && px_near(out, 0, 0, 0, 255, 1);
+
+	if (ok) {
+		[t pass:@"a 4x pass resolved into the drawable (%lux%lu): inside white, outside black%@", (unsigned long)W,
+		    (unsigned long)H, grey ? @", the edge grey" : @" (no grey pixel found on the edge)"];
+	} else {
+		[t fail:@"read back inside B G R A %u %u %u %u (want white), outside %u %u %u %u (want black)", in[0], in[1],
+		    in[2], in[3], out[0], out[1], out[2], out[3]];
+	}
+	[layer removeFromSuperlayer];
+}
+
 /* one compute dispatch of our kernel `name` over n threads in groups of `group`; `bind` sets its arguments */
 static BOOL
 dispatch_ours(id<MTLFunction> function, NSUInteger n, NSUInteger group, void (^bind)(id<MTLComputeCommandEncoder>),
@@ -7289,6 +7392,7 @@ static const struct {
 	{ "metal.simd", test_metal_simd },
 	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
+	{ "metal.msaa.drawable", test_metal_msaa_drawable },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
