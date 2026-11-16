@@ -3265,6 +3265,133 @@ test_metal_msaa_chain_screen(MetalTest *t)
 	[layer removeFromSuperlayer];
 }
 
+/*
+ * msaa.vsout: the shapes of Impeller's vertex stages (SPIRV-Cross output) under freedreno's hardware binning -- the
+ * position LAST in the output struct after varyings, [[position, invariant]], and vertex data through a vertex
+ * descriptor at buffer index 30 -- each drawn as a quad into a 512x512 texture through a memoryless 4x attachment
+ * resolved in the tiles (GMEM with binning on the K40 port). On 11-16/17 every draw of Flutter's was lost under
+ * binning (rounds b16-b31: the drawable and its 192x192 layers empty; drawn with metal_fd_debug=nobin) while these
+ * tests' own simpler vertex stages were fine.
+ */
+static NSString *const kVsOutSource = @
+	"#include <metal_stdlib>\n"
+	"using namespace metal;\n"
+	"struct FirstOut { float4 pos [[position]]; float4 color [[user(locn0)]]; };\n"
+	"struct LastOut { float2 uv [[user(locn0)]]; float4 color [[user(locn1)]]; float4 pos [[position]]; };\n"
+	"struct LastInvOut { float2 uv [[user(locn0)]]; float4 color [[user(locn1)]]; float4 pos [[position, invariant]]; };\n"
+	"struct VIn30 { float2 pos [[attribute(0)]]; };\n"
+	"vertex FirstOut vs_first(uint vid [[vertex_id]], constant float4 *v [[buffer(0)]]) {\n"
+	"  FirstOut o; o.pos = v[vid]; o.color = float4(1, 0.5, 0.25, 1); return o; }\n"
+	"vertex LastOut vs_last(uint vid [[vertex_id]], constant float4 *v [[buffer(0)]]) {\n"
+	"  LastOut o; o.uv = v[vid].xy; o.color = float4(1, 0.5, 0.25, 1); o.pos = v[vid]; return o; }\n"
+	"vertex LastInvOut vs_last_inv(uint vid [[vertex_id]], constant float4 *v [[buffer(0)]]) {\n"
+	"  LastInvOut o; o.uv = v[vid].xy; o.color = float4(1, 0.5, 0.25, 1); o.pos = v[vid]; return o; }\n"
+	"vertex LastInvOut vs_last_inv30(VIn30 in [[stage_in]], constant float4 &scale [[buffer(1)]]) {\n"
+	"  LastInvOut o; o.uv = in.pos; o.color = float4(1, 0.5, 0.25, 1); o.pos = float4(in.pos * scale.xy, 0, 1); return o; }\n"
+	"fragment float4 fs_first(FirstOut in [[stage_in]]) { return in.color; }\n"
+	"fragment float4 fs_last(LastOut in [[stage_in]]) { return in.color; }\n"
+	"fragment float4 fs_last_inv(LastInvOut in [[stage_in]]) { return in.color; }\n";
+
+static void
+test_metal_msaa_vsout(MetalTest *t)
+{
+	static const struct { const char *name, *vs, *fs; BOOL stream30; } kinds[] = {
+		{ "position first", "vs_first", "fs_first", NO },
+		{ "position last", "vs_last", "fs_last", NO },
+		{ "position last, invariant", "vs_last_inv", "fs_last_inv", NO },
+		{ "position last, invariant, stage_in at buffer 30", "vs_last_inv30", "fs_last_inv", YES },
+	};
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	NSMutableString *said = [NSMutableString string];
+	unsigned bad = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kVsOutSource options:nil error:&error]) == nil) {
+		[t fail:@"no library: %@", error.localizedDescription];
+		return;
+	}
+	for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		    width:512 height:512 mipmapped:NO];
+		id<MTLTexture> target, samples;
+		MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+		id<MTLRenderPipelineState> pipeline;
+
+		d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		target = [g_device newTextureWithDescriptor:d];
+		d.textureType = MTLTextureType2DMultisample;
+		d.sampleCount = 4;
+		d.usage = MTLTextureUsageRenderTarget;
+		d.storageMode = MTLStorageModeMemoryless;
+		samples = [g_device newTextureWithDescriptor:d];
+		p.vertexFunction = [lib newFunctionWithName:@(kinds[k].vs)];
+		p.fragmentFunction = [lib newFunctionWithName:@(kinds[k].fs)];
+		p.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		p.rasterSampleCount = 4;
+		if (kinds[k].stream30) {
+			MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+
+			vd.attributes[0].format = MTLVertexFormatFloat2;
+			vd.attributes[0].bufferIndex = 30;
+			vd.layouts[30].stride = 8;
+			p.vertexDescriptor = vd;
+		}
+		if (target == nil || samples == nil || p.vertexFunction == nil ||
+		    (pipeline = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+			[said appendFormat:@" %s: no pipeline (%@);", kinds[k].name, error.localizedDescription ?: @"?"];
+			bad++;
+			continue;
+		}
+		id<MTLCommandBuffer> buffer = [[g_device newCommandQueue] commandBuffer];
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+		pass.colorAttachments[0].texture = samples;
+		pass.colorAttachments[0].resolveTexture = target;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+		id<MTLRenderCommandEncoder> e = [buffer renderCommandEncoderWithDescriptor:pass];
+
+		[e setRenderPipelineState:pipeline];
+		if (kinds[k].stream30) {
+			const float quad[6][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } };
+			const float scale[4] = { 0.5f, 0.5f, 0, 0 };
+
+			[e setVertexBytes:quad length:sizeof(quad) atIndex:30];
+			[e setVertexBytes:scale length:sizeof(scale) atIndex:1];
+		} else {
+			const float quad[6][4] = { { -0.5f, -0.5f, 0, 1 }, { 0.5f, -0.5f, 0, 1 }, { -0.5f, 0.5f, 0, 1 },
+			    { 0.5f, -0.5f, 0, 1 }, { 0.5f, 0.5f, 0, 1 }, { -0.5f, 0.5f, 0, 1 } };
+
+			[e setVertexBytes:quad length:sizeof(quad) atIndex:0];
+		}
+		[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+		[e endEncoding];
+		[buffer commit];
+		[buffer waitUntilCompleted];
+		unsigned char in[4] = { 0 }, out[4] = { 0 };
+
+		[target getBytes:in bytesPerRow:4 fromRegion:MTLRegionMake2D(256, 256, 1, 1) mipmapLevel:0];
+		[target getBytes:out bytesPerRow:4 fromRegion:MTLRegionMake2D(20, 20, 1, 1) mipmapLevel:0];
+		BOOL ok = buffer.status == MTLCommandBufferStatusCompleted && px_near(in, 64, 128, 255, 255, 3) &&
+		    px_near(out, 0, 0, 0, 0, 0);
+
+		if (!ok) {
+			bad++;
+		}
+		[said appendFormat:@" %s: %s (centre B G R A %u %u %u %u);", kinds[k].name, ok ? "drawn" : "LOST", in[0], in[1],
+		    in[2], in[3]];
+	}
+	if (bad == 0) {
+		[t pass:@"a quad through a 4x pass resolved in the tiles, each vertex-stage shape:%@", said];
+	} else {
+		[t fail:@"%u of %zu vertex-stage shapes not drawn:%@", bad, sizeof(kinds) / sizeof(kinds[0]), said];
+	}
+}
+
 static void
 test_metal_msaa_depth(MetalTest *t)
 {
@@ -8190,6 +8317,7 @@ static const struct {
 	{ "metal.msaa.depth.screen", test_metal_msaa_depth_screen },
 	{ "metal.msaa.chain", test_metal_msaa_chain },
 	{ "metal.msaa.chain.screen", test_metal_msaa_chain_screen },
+	{ "metal.msaa.vsout", test_metal_msaa_vsout },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
