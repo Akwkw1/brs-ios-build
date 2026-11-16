@@ -2197,6 +2197,92 @@ test_metal_indirect_dispatch(MetalTest *t)
 	}
 }
 
+/*
+ * occlusion: visibility results (setVisibilityResultMode:offset:). Counting at offset 0 over two triangles that cover
+ * the target once between them (summed: SIDE x SIDE samples, one per pixel), a triangle wholly behind the first one
+ * counted at offset 8 (0), a Boolean query at offset 16 over a visible one (1), offset 24 never enabled (left as it
+ * was filled). An engine's occlusion culling reads exactly these.
+ */
+static void
+test_metal_occlusion(MetalTest *t)
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+	    width:SIDE height:SIDE mipmapped:NO];
+	MTLDepthStencilDescriptor *ds = [MTLDepthStencilDescriptor new];
+	__block id<MTLDepthStencilState> state;
+	id<MTLTexture> depth;
+	id<MTLBuffer> results;
+	NSString *problem = nil;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	d.usage = MTLTextureUsageRenderTarget;
+	d.storageMode = MTLStorageModePrivate;
+	ds.depthCompareFunction = MTLCompareFunctionLess;
+	ds.depthWriteEnabled = YES;
+	depth = [g_device newTextureWithDescriptor:d];
+	state = [g_device newDepthStencilStateWithDescriptor:ds];
+	results = [g_device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+	if (depth == nil || state == nil || results == nil) {
+		[t fail:@"%@", depth == nil ? @"no Depth32Float texture" : state == nil ? @"no depth/stencil state" : @"no buffer"];
+		return;
+	}
+	memset(results.contents, 0xEE, 32);
+	if (!render_ours(@"v_colored", @"f_color", MTLClearColorMake(0, 0, 0, 1), ^(MTLRenderPipelineDescriptor *p) {
+		    p.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	    }, ^(MTLRenderPassDescriptor *pass) {
+		    pass.depthAttachment.texture = depth;
+		    pass.depthAttachment.loadAction = MTLLoadActionClear;
+		    pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+		    pass.depthAttachment.clearDepth = 1.0;
+		    pass.visibilityResultBuffer = results;
+	    }, ^(id<MTLRenderCommandEncoder> e) {
+		    /* lower left half at z 0.2; the same half again at z 0.8 (hidden); the upper right half at z 0.5, and at 0.3 */
+		    const float lowerNear[3][8] = {
+			    { -1, -1, 0.2f, 1, 1, 0, 0, 1 }, { 1, -1, 0.2f, 1, 1, 0, 0, 1 }, { -1, 1, 0.2f, 1, 1, 0, 0, 1 },
+		    };
+		    const float lowerFar[3][8] = {
+			    { -1, -1, 0.8f, 1, 0, 0, 1, 1 }, { 1, -1, 0.8f, 1, 0, 0, 1, 1 }, { -1, 1, 0.8f, 1, 0, 0, 1, 1 },
+		    };
+		    const float upperMid[3][8] = {
+			    { 1, -1, 0.5f, 1, 0, 1, 0, 1 }, { 1, 1, 0.5f, 1, 0, 1, 0, 1 }, { -1, 1, 0.5f, 1, 0, 1, 0, 1 },
+		    };
+		    const float upperNear[3][8] = {
+			    { 1, -1, 0.3f, 1, 1, 1, 0, 1 }, { 1, 1, 0.3f, 1, 1, 1, 0, 1 }, { -1, 1, 0.3f, 1, 1, 1, 0, 1 },
+		    };
+
+		    [e setDepthStencilState:state];
+		    [e setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+		    [e setVertexBytes:lowerNear length:sizeof(lowerNear) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    [e setVisibilityResultMode:MTLVisibilityResultModeCounting offset:8];
+		    [e setVertexBytes:lowerFar length:sizeof(lowerFar) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    [e setVisibilityResultMode:MTLVisibilityResultModeBoolean offset:16];
+		    [e setVertexBytes:upperMid length:sizeof(upperMid) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    [e setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+		    [e setVertexBytes:upperNear length:sizeof(upperNear) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    [e setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+	    }, px, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const uint64_t *r = results.contents;
+	BOOL ok = r[0] == SIDE * SIDE && r[1] == 0 && r[2] != 0 && r[3] == 0xEEEEEEEEEEEEEEEEull;
+
+	if (ok) {
+		[t pass:@"counted %llu samples (%u pixels, two halves summed), 0 hidden, Boolean %llu, the unused offset left alone",
+		    r[0], SIDE * SIDE, r[2]];
+	} else {
+		[t fail:@"results %llu (want %u), %llu (want 0), %llu (want nonzero), %#llx (want 0xeeeeeeeeeeeeeeee, untouched)",
+		    r[0], SIDE * SIDE, r[1], r[2], r[3]];
+	}
+}
+
 /* depth: a near red triangle first, then a far blue one over the whole target -- red stays where both are */
 static void
 test_metal_depth(MetalTest *t)
@@ -7117,6 +7203,7 @@ static const struct {
 	{ "metal.dontcare", test_metal_dontcare },
 	{ "metal.setbytes.many", test_metal_setbytes_many },
 	{ "metal.simd", test_metal_simd },
+	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
