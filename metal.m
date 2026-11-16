@@ -2583,11 +2583,16 @@ test_metal_msaa_drawable(MetalTest *t)
 	[drawable.texture getBytes:out bytesPerRow:4 fromRegion:MTLRegionMake2D(W * 3 / 4, H / 4, 1, 1) mipmapLevel:0];
 	unsigned grey = 0;
 
-	for (NSUInteger x = 0; x < W && grey == 0; x++) {
-		NSUInteger y = H - 1 - x * H / W;       /* (the triangle's edge from (0,H) to (W,0)) */
+	/* (the triangle's long edge runs from the top left (-1, 1) to the bottom right (1, -1): rows from the top, y = x H / W;
+	 * a pixel on either side of it, so that one the edge crosses is met) */
+	for (NSUInteger x = 1; x + 1 < W && grey == 0; x++) {
+		NSUInteger y = x * H / W;
 
-		[drawable.texture getBytes:edge bytesPerRow:4 fromRegion:MTLRegionMake2D(x, MIN(y, H - 1), 1, 1) mipmapLevel:0];
-		grey += edge[0] > 16 && edge[0] < 240;
+		for (NSUInteger dy = 0; dy < 3 && grey == 0 && y + dy >= 1 && y + dy - 1 < H; dy++) {
+			[drawable.texture getBytes:edge bytesPerRow:4 fromRegion:MTLRegionMake2D(x, y + dy - 1, 1, 1)
+				       mipmapLevel:0];
+			grey += edge[0] > 16 && edge[0] < 240;
+		}
 	}
 	BOOL ok = px_near(in, 255, 255, 255, 255, 1) && px_near(out, 0, 0, 0, 255, 1);
 
