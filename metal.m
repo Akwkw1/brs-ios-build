@@ -2865,6 +2865,238 @@ msaa_many_round(id<MTLTexture> target, id<CAMetalDrawable> drawable, unsigned *w
 	    (unsigned long)H, *wrong, sizeof(at) / sizeof(at[0]), seen];
 }
 
+/*
+ * msaa.depth / msaa.depth.screen: the same pass with Impeller's other habits -- a vertex descriptor (float2 from
+ * buffer 0), a uniform block per draw at buffer 1 (-setVertexBytes:), 16-bit indexed draws from an MTLBuffer, a DEPTH
+ * clip (the left half written to depth 0.5 with no colour) and 400 quads at depth 0.6, all tested LessEqual with
+ * depth writes, every other one alpha-blended -- so the right half shows the quads, the left the clear colour. On
+ * the K40 port Flutter's pass resolved in the tiles was lost with freedreno's hardware binning on (round b17) and
+ * drawn with it off (b18); the stencil-clipped msaa.many was right either way, and freedreno's binning pass culls
+ * by LRZ, which only depth tests use.
+ */
+static NSString *const kDepthClipSource = @
+	"#include <metal_stdlib>\n"
+	"using namespace metal;\n"
+	"struct DIn { float2 pos [[attribute(0)]]; };\n"
+	"struct DFrame { float4 scale_offset; float4 color; float depth; };\n"
+	"struct DOut { float4 pos [[position]]; float4 color; };\n"
+	"vertex DOut d_vertex(DIn in [[stage_in]], constant DFrame &f [[buffer(1)]]) {\n"
+	"  DOut o; o.pos = float4(in.pos * f.scale_offset.xy + f.scale_offset.zw, f.depth, 1.0); o.color = f.color; return o;\n"
+	"}\n"
+	"fragment float4 d_fragment(DOut in [[stage_in]]) { return in.color; }\n";
+
+struct depth_frame {
+	float scale_offset[4];
+	float color[4];
+	float depth;
+	float pad[3];
+};
+
+static NSString *
+msaa_depth_round(id<MTLTexture> target, id<CAMetalDrawable> drawable, unsigned *wrong)
+{
+	NSUInteger W = target.width, H = target.height;
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W
+	    height:H mipmapped:NO];
+	id<MTLTexture> samples, depth;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+	id<MTLRenderPipelineState> clip, opaque, blended;
+	MTLDepthStencilDescriptor *sd = [MTLDepthStencilDescriptor new];
+	id<MTLDepthStencilState> always, lequal;
+
+	*wrong = 0;
+	if ((lib = [g_device newLibraryWithSource:kDepthClipSource options:nil error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no library: %@", error.localizedDescription];
+	}
+	d.textureType = MTLTextureType2DMultisample;
+	d.sampleCount = 4;
+	d.usage = MTLTextureUsageRenderTarget;
+	d.storageMode = MTLStorageModeMemoryless;
+	samples = [g_device newTextureWithDescriptor:d];
+	d.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	depth = [g_device newTextureWithDescriptor:d];
+	if (samples == nil || depth == nil) {
+		return @"no memoryless 4x textures of the target's size";
+	}
+	vd.attributes[0].format = MTLVertexFormatFloat2;
+	vd.attributes[0].offset = 0;
+	vd.attributes[0].bufferIndex = 0;
+	vd.layouts[0].stride = 8;
+	p.vertexFunction = [lib newFunctionWithName:@"d_vertex"];
+	p.fragmentFunction = [lib newFunctionWithName:@"d_fragment"];
+	p.vertexDescriptor = vd;
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	p.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	p.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	p.rasterSampleCount = 4;
+	if ((opaque = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no pipeline: %@", error.localizedDescription];
+	}
+	p.colorAttachments[0].blendingEnabled = YES;
+	p.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+	p.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	p.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	p.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	if ((blended = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no blending pipeline: %@", error.localizedDescription];
+	}
+	p.colorAttachments[0].blendingEnabled = NO;
+	p.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+	if ((clip = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no clip pipeline: %@", error.localizedDescription];
+	}
+	sd.depthCompareFunction = MTLCompareFunctionAlways;
+	sd.depthWriteEnabled = YES;
+	always = [g_device newDepthStencilStateWithDescriptor:sd];
+	sd.depthCompareFunction = MTLCompareFunctionLessEqual;
+	lequal = [g_device newDepthStencilStateWithDescriptor:sd];
+
+	const float quad[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+	const uint16_t indices[6] = { 0, 1, 2, 2, 1, 3 };
+	id<MTLBuffer> vertices = [g_device newBufferWithBytes:quad length:sizeof(quad) options:MTLResourceStorageModeShared];
+	id<MTLBuffer> index = [g_device newBufferWithBytes:indices length:sizeof(indices) options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> buffer = [[g_device newCommandQueue] commandBuffer];
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+	pass.colorAttachments[0].texture = samples;
+	pass.colorAttachments[0].resolveTexture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	pass.depthAttachment.texture = depth;
+	pass.depthAttachment.loadAction = MTLLoadActionClear;
+	pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+	pass.depthAttachment.clearDepth = 1.0;
+	pass.stencilAttachment.texture = depth;
+	pass.stencilAttachment.loadAction = MTLLoadActionClear;
+	pass.stencilAttachment.storeAction = MTLStoreActionDontCare;
+	id<MTLRenderCommandEncoder> e = [buffer renderCommandEncoderWithDescriptor:pass];
+	struct depth_frame f;
+
+	[e setVertexBuffer:vertices offset:0 atIndex:0];
+	/* the clip: the left half, x -1..0, depth 0.5, no colour */
+	memset(&f, 0, sizeof(f));
+	f.scale_offset[0] = 1, f.scale_offset[1] = 2, f.scale_offset[2] = -1, f.scale_offset[3] = -1;
+	f.depth = 0.5f;
+	/* (LessEqual like the quads: one depth direction for the whole pass keeps freedreno's LRZ valid, as Impeller's
+	 * clips do; an Always would turn LRZ off and test nothing) */
+	[e setRenderPipelineState:clip];
+	[e setDepthStencilState:lequal];
+	[e setVertexBytes:&f length:sizeof(f) atIndex:1];
+	[e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:index
+	       indexBufferOffset:0];
+	(void)always;
+	for (unsigned gy = 0; gy < 20; gy++) {
+		for (unsigned gx = 0; gx < 20; gx++) {
+			memset(&f, 0, sizeof(f));
+			f.scale_offset[0] = 0.08f, f.scale_offset[1] = 0.08f;
+			f.scale_offset[2] = -1 + gx * 0.1f + 0.01f, f.scale_offset[3] = -1 + gy * 0.1f + 0.01f;
+			f.color[0] = gx / 19.0f, f.color[1] = gy / 19.0f, f.color[2] = 0.5f, f.color[3] = 1;
+			f.depth = 0.6f;
+			[e setRenderPipelineState:(gx + gy) & 1 ? blended : opaque];
+			[e setVertexBytes:&f length:sizeof(f) atIndex:1];
+			[e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16
+				     indexBuffer:index indexBufferOffset:0];
+		}
+	}
+	[e endEncoding];
+	if (drawable != nil) {
+		[buffer presentDrawable:drawable];
+	}
+	[buffer commit];
+	[buffer waitUntilCompleted];
+	if (buffer.status != MTLCommandBufferStatusCompleted) {
+		return [NSString stringWithFormat:@"the command buffer ended with status %ld: %@", (long)buffer.status,
+		    buffer.error.localizedDescription];
+	}
+	static const unsigned at[][2] = { { 2, 3 }, { 7, 15 }, { 9, 0 }, { 0, 19 }, { 12, 5 }, { 17, 18 }, { 10, 10 }, { 15, 1 } };
+	NSMutableString *seen = [NSMutableString string];
+
+	for (unsigned k = 0; k < sizeof(at) / sizeof(at[0]); k++) {
+		unsigned gx = at[k][0], gy = at[k][1];
+		NSUInteger px = (NSUInteger)(((-1 + (gx + 0.5) * 0.1) + 1) / 2 * W);
+		NSUInteger py = (NSUInteger)((1 - (-1 + (gy + 0.5) * 0.1)) / 2 * H);
+		unsigned char b[4];
+		BOOL shown = gx >= 10;
+		unsigned wr = shown ? (unsigned)lrintf(gx / 19.0f * 255) : 0, wg = shown ? (unsigned)lrintf(gy / 19.0f * 255) : 0;
+		unsigned wb = shown ? 128 : 0;
+
+		[target getBytes:b bytesPerRow:4 fromRegion:MTLRegionMake2D(px, py, 1, 1) mipmapLevel:0];
+		if (!px_near(b, wb, wg, wr, 255, 3)) {
+			(*wrong)++;
+			[seen appendFormat:@" (%u,%u) B G R A %u %u %u %u, want %u %u %u 255;", gx, gy, b[0], b[1], b[2], b[3], wb, wg, wr];
+		}
+	}
+	return [NSString stringWithFormat:@"%lux%lu, a depth clip + 400 indexed draws (half blended): %u of %zu points "
+	    "wrong%@", (unsigned long)W, (unsigned long)H, *wrong, sizeof(at) / sizeof(at[0]), seen];
+}
+
+static void
+test_metal_msaa_depth(MetalTest *t)
+{
+	CGSize size = UIScreen.mainScreen.nativeBounds.size;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	    width:(NSUInteger)size.width height:(NSUInteger)size.height mipmapped:NO];
+	id<MTLTexture> target;
+	unsigned wrong;
+	NSString *said;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	if ((target = [g_device newTextureWithDescriptor:d]) == nil) {
+		[t fail:@"no %gx%g texture", size.width, size.height];
+		return;
+	}
+	said = msaa_depth_round(target, nil, &wrong);
+	if (wrong == 0 && [said hasPrefix:@"no "] == NO && [said hasPrefix:@"the command"] == NO) {
+		[t pass:@"into a texture: %@", said];
+	} else {
+		[t fail:@"into a texture: %@", said];
+	}
+}
+
+static void
+test_metal_msaa_depth_screen(MetalTest *t)
+{
+	CAMetalLayer *layer;
+	id<CAMetalDrawable> drawable;
+	unsigned wrong;
+	NSString *said;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if (g_stage == nil) {
+		[t skip:@"nowhere on the screen to put a layer"];
+		return;
+	}
+	layer = [CAMetalLayer layer];
+	layer.device = g_device;
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	layer.framebufferOnly = NO;
+	layer.frame = g_stage.bounds;
+	layer.contentsScale = UIScreen.mainScreen.scale;
+	layer.drawableSize = UIScreen.mainScreen.nativeBounds.size;
+	[g_stage.layer addSublayer:layer];
+	if ((drawable = [layer nextDrawable]) == nil) {
+		[t fail:@"the layer gave no drawable"];
+		[layer removeFromSuperlayer];
+		return;
+	}
+	said = msaa_depth_round(drawable.texture, drawable, &wrong);
+	if (wrong == 0 && [said hasPrefix:@"no "] == NO && [said hasPrefix:@"the command"] == NO) {
+		[t pass:@"into a drawable: %@", said];
+	} else {
+		[t fail:@"into a drawable: %@", said];
+	}
+	[layer removeFromSuperlayer];
+}
+
 static void
 test_metal_msaa_many(MetalTest *t)
 {
@@ -7723,6 +7955,8 @@ static const struct {
 	{ "metal.msaa.screen", test_metal_msaa_screen },
 	{ "metal.msaa.many", test_metal_msaa_many },
 	{ "metal.msaa.many.screen", test_metal_msaa_many_screen },
+	{ "metal.msaa.depth", test_metal_msaa_depth },
+	{ "metal.msaa.depth.screen", test_metal_msaa_depth_screen },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
