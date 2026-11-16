@@ -2736,6 +2736,198 @@ test_metal_msaa_screen(MetalTest *t)
 	}
 }
 
+/*
+ * msaa.many / msaa.many.screen: Flutter's on-screen pass in WORK, not just shape -- a memoryless 4x BGRA8 + 4x
+ * Depth32Float_Stencil8 pass of the screen's size, cleared, a stencil clip written over the left half with no colour,
+ * then 400 small quads (a 20 x 20 grid, each its own -setVertexBytes: and draw, like Impeller's) drawn where the
+ * stencil is 1, resolved into a one-sample texture -- an ordinary one (msaa.many) or a drawable (msaa.many.screen).
+ * Read back: quads on the left in their own colours, those on the right not drawn. On the K40 port Flutter's 300-draw
+ * pass resolved in the tiles came out all zero while a one-draw pass of the same shape was right (11-16).
+ */
+static NSString *
+msaa_many_round(id<MTLTexture> target, id<CAMetalDrawable> drawable, unsigned *wrong)
+{
+	NSUInteger W = target.width, H = target.height;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W
+	    height:H mipmapped:NO];
+	id<MTLTexture> samples, depth;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	id<MTLRenderPipelineState> clip, cover;
+	MTLDepthStencilDescriptor *sd = [MTLDepthStencilDescriptor new];
+	MTLStencilDescriptor *st = [MTLStencilDescriptor new];
+	id<MTLDepthStencilState> writes, tests;
+	NSError *error = nil;
+
+	*wrong = 0;
+	d.textureType = MTLTextureType2DMultisample;
+	d.sampleCount = 4;
+	d.usage = MTLTextureUsageRenderTarget;
+	d.storageMode = MTLStorageModeMemoryless;
+	samples = [g_device newTextureWithDescriptor:d];
+	d.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	depth = [g_device newTextureWithDescriptor:d];
+	if (samples == nil || depth == nil) {
+		return @"no memoryless 4x textures of the target's size";
+	}
+	p.vertexFunction = [g_ours newFunctionWithName:@"v_colored"];
+	p.fragmentFunction = [g_ours newFunctionWithName:@"f_color"];
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	p.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	p.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	p.rasterSampleCount = 4;
+	if ((cover = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no pipeline: %@", error.localizedDescription];
+	}
+	p.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+	if ((clip = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		return [NSString stringWithFormat:@"no clip pipeline: %@", error.localizedDescription];
+	}
+	st.stencilCompareFunction = MTLCompareFunctionAlways;
+	st.depthStencilPassOperation = MTLStencilOperationReplace;
+	sd.frontFaceStencil = st;
+	sd.backFaceStencil = st;
+	writes = [g_device newDepthStencilStateWithDescriptor:sd];
+	st = [MTLStencilDescriptor new];
+	st.stencilCompareFunction = MTLCompareFunctionEqual;
+	sd.frontFaceStencil = st;
+	sd.backFaceStencil = st;
+	tests = [g_device newDepthStencilStateWithDescriptor:sd];
+
+	id<MTLCommandBuffer> buffer = [[g_device newCommandQueue] commandBuffer];
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+	pass.colorAttachments[0].texture = samples;
+	pass.colorAttachments[0].resolveTexture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	pass.depthAttachment.texture = depth;
+	pass.depthAttachment.loadAction = MTLLoadActionClear;
+	pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+	pass.stencilAttachment.texture = depth;
+	pass.stencilAttachment.loadAction = MTLLoadActionClear;
+	pass.stencilAttachment.storeAction = MTLStoreActionDontCare;
+	pass.stencilAttachment.clearStencil = 0;
+	id<MTLRenderCommandEncoder> e = [buffer renderCommandEncoderWithDescriptor:pass];
+	const float half[6][8] = { { -1, -1, 0, 1, 0, 0, 0, 1 }, { 0, -1, 0, 1, 0, 0, 0, 1 }, { -1, 1, 0, 1, 0, 0, 0, 1 },
+	    { 0, -1, 0, 1, 0, 0, 0, 1 }, { 0, 1, 0, 1, 0, 0, 0, 1 }, { -1, 1, 0, 1, 0, 0, 0, 1 } };
+
+	[e setRenderPipelineState:clip];
+	[e setDepthStencilState:writes];
+	[e setStencilReferenceValue:1];
+	[e setVertexBytes:half length:sizeof(half) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[e setRenderPipelineState:cover];
+	[e setDepthStencilState:tests];
+	for (unsigned gy = 0; gy < 20; gy++) {
+		for (unsigned gx = 0; gx < 20; gx++) {
+			float x0 = -1 + gx * 0.1f + 0.01f, x1 = -1 + (gx + 1) * 0.1f - 0.01f;
+			float y0 = -1 + gy * 0.1f + 0.01f, y1 = -1 + (gy + 1) * 0.1f - 0.01f;
+			float r = gx / 19.0f, g = gy / 19.0f;
+			const float q[6][8] = { { x0, y0, 0, 1, r, g, 0.5f, 1 }, { x1, y0, 0, 1, r, g, 0.5f, 1 },
+			    { x0, y1, 0, 1, r, g, 0.5f, 1 }, { x1, y0, 0, 1, r, g, 0.5f, 1 }, { x1, y1, 0, 1, r, g, 0.5f, 1 },
+			    { x0, y1, 0, 1, r, g, 0.5f, 1 } };
+
+			[e setVertexBytes:q length:sizeof(q) atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+		}
+	}
+	[e endEncoding];
+	if (drawable != nil) {
+		[buffer presentDrawable:drawable];
+	}
+	[buffer commit];
+	[buffer waitUntilCompleted];
+	if (buffer.status != MTLCommandBufferStatusCompleted) {
+		return [NSString stringWithFormat:@"the command buffer ended with status %ld: %@", (long)buffer.status,
+		    buffer.error.localizedDescription];
+	}
+	/* a quad's centre: x from the left, rows from the top (Metal's y up) */
+	static const unsigned at[][2] = { { 2, 3 }, { 7, 15 }, { 9, 0 }, { 0, 19 }, { 12, 5 }, { 17, 18 }, { 10, 10 } };
+	NSMutableString *seen = [NSMutableString string];
+
+	for (unsigned k = 0; k < sizeof(at) / sizeof(at[0]); k++) {
+		unsigned gx = at[k][0], gy = at[k][1];
+		NSUInteger px = (NSUInteger)(((-1 + (gx + 0.5) * 0.1) + 1) / 2 * W);
+		NSUInteger py = (NSUInteger)((1 - (-1 + (gy + 0.5) * 0.1)) / 2 * H);
+		unsigned char b[4];
+		BOOL left = gx < 10;
+		unsigned wr = left ? (unsigned)lrintf(gx / 19.0f * 255) : 0, wg = left ? (unsigned)lrintf(gy / 19.0f * 255) : 0;
+		unsigned wb = left ? 128 : 0;
+
+		[target getBytes:b bytesPerRow:4 fromRegion:MTLRegionMake2D(px, py, 1, 1) mipmapLevel:0];
+		if (!px_near(b, wb, wg, wr, 255, 3)) {
+			(*wrong)++;
+			[seen appendFormat:@" (%u,%u) B G R A %u %u %u %u, want %u %u %u 255;", gx, gy, b[0], b[1], b[2], b[3], wb, wg, wr];
+		}
+	}
+	return [NSString stringWithFormat:@"%lux%lu, 1 clip + 400 draws: %u of %zu points wrong%@", (unsigned long)W,
+	    (unsigned long)H, *wrong, sizeof(at) / sizeof(at[0]), seen];
+}
+
+static void
+test_metal_msaa_many(MetalTest *t)
+{
+	CGSize size = UIScreen.mainScreen.nativeBounds.size;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	    width:(NSUInteger)size.width height:(NSUInteger)size.height mipmapped:NO];
+	id<MTLTexture> target;
+	unsigned wrong;
+	NSString *said;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	if ((target = [g_device newTextureWithDescriptor:d]) == nil) {
+		[t fail:@"no %gx%g texture", size.width, size.height];
+		return;
+	}
+	said = msaa_many_round(target, nil, &wrong);
+	if (wrong == 0 && [said hasPrefix:@"no "] == NO && [said hasPrefix:@"the command"] == NO) {
+		[t pass:@"into a texture: %@", said];
+	} else {
+		[t fail:@"into a texture: %@", said];
+	}
+}
+
+static void
+test_metal_msaa_many_screen(MetalTest *t)
+{
+	CAMetalLayer *layer;
+	id<CAMetalDrawable> drawable;
+	unsigned wrong;
+	NSString *said;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if (g_stage == nil) {
+		[t skip:@"nowhere on the screen to put a layer"];
+		return;
+	}
+	layer = [CAMetalLayer layer];
+	layer.device = g_device;
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	layer.framebufferOnly = NO;
+	layer.frame = g_stage.bounds;
+	layer.contentsScale = UIScreen.mainScreen.scale;
+	layer.drawableSize = UIScreen.mainScreen.nativeBounds.size;
+	[g_stage.layer addSublayer:layer];
+	if ((drawable = [layer nextDrawable]) == nil) {
+		[t fail:@"the layer gave no drawable"];
+		[layer removeFromSuperlayer];
+		return;
+	}
+	said = msaa_many_round(drawable.texture, drawable, &wrong);
+	if (wrong == 0 && [said hasPrefix:@"no "] == NO && [said hasPrefix:@"the command"] == NO) {
+		[t pass:@"into a drawable: %@", said];
+	} else {
+		[t fail:@"into a drawable: %@", said];
+	}
+	[layer removeFromSuperlayer];
+}
+
 /* one compute dispatch of our kernel `name` over n threads in groups of `group`; `bind` sets its arguments */
 static BOOL
 dispatch_ours(id<MTLFunction> function, NSUInteger n, NSUInteger group, void (^bind)(id<MTLComputeCommandEncoder>),
@@ -7529,6 +7721,8 @@ static const struct {
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.msaa.drawable", test_metal_msaa_drawable },
 	{ "metal.msaa.screen", test_metal_msaa_screen },
+	{ "metal.msaa.many", test_metal_msaa_many },
+	{ "metal.msaa.many.screen", test_metal_msaa_many_screen },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
