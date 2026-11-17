@@ -8441,6 +8441,114 @@ test_metal_nonuniform_grid(MetalTest *t)
 	    "threads_per_grid, threads_per_threadgroup"];
 }
 
+/*
+ * Functions the iOS 16.5 system image's own Metal libraries use and the K40 port's translator refused until 11-17
+ * evening (its run over the image's 117 metallibs): atanh, asinh, acosh, sinpi, cospi, unpack_snorm4x8_to_float,
+ * hadd, rhadd, quad_shuffle_down and thread_index_in_quadgroup, each compared with this processor's answer.
+ */
+static NSString *const kMoreFunctionsSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_more(device float *f [[buffer(0)]], device uint *u [[buffer(1)]],\n"
+"    uint gid [[thread_position_in_grid]], uint q [[thread_index_in_quadgroup]]) {\n"
+"    float x = (float(gid) - 32.0f) / 40.0f;\n"
+"    device float *o = f + gid * 12u;\n"
+"    o[0] = atanh(x);\n"
+"    o[1] = asinh(x * 10.0f);\n"
+"    o[2] = acosh(1.0f + fabs(x) * 10.0f);\n"
+"    o[3] = sinpi(x * 5.0f);\n"
+"    o[4] = cospi(x * 5.0f);\n"
+"    float4 s = unpack_snorm4x8_to_float(gid * 0x2f63f107u);\n"
+"    o[5] = s.x; o[6] = s.y; o[7] = s.z; o[8] = s.w;\n"
+"    o[9] = quad_shuffle_down(float(gid), 1u);\n"
+"    o[10] = float(q);\n"
+"    o[11] = 0.0f;\n"
+"    u[gid * 2u] = rhadd(gid * 1000u, 0xfffffff0u - gid);\n"
+"    u[gid * 2u + 1u] = as_type<uint>(hadd(int(gid) - 40, -7));\n"
+"}\n";
+
+static void
+test_metal_more_functions(MetalTest *t)
+{
+	enum { N = 64 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kMoreFunctionsSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_more"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> fb = [g_device newBufferWithLength:N * 12 * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> ub = [g_device newBufferWithLength:N * 2 * 4 options:MTLResourceStorageModeShared];
+	memset(fb.contents, 0, fb.length);
+	memset(ub.contents, 0, ub.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setBuffer:fb offset:0 atIndex:0];
+	[e setBuffer:ub offset:0 atIndex:1];
+	[e dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	static const char *const names[12] = { "atanh", "asinh", "acosh", "sinpi", "cospi", "snorm.x", "snorm.y",
+	                                       "snorm.z", "snorm.w", "quad_shuffle_down", "thread_index_in_quadgroup", "" };
+	const float *f = fb.contents;
+	const uint32_t *u = ub.contents;
+	unsigned bad[14] = { 0 }, total = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned g = 0; g < N; g++) {
+		float x = ((float)g - 32.0f) / 40.0f;
+		uint32_t packed = g * 0x2f63f107u;
+		float want[12] = {
+			atanhf(x), asinhf(x * 10.0f), acoshf(1.0f + fabsf(x) * 10.0f), sinf((float)M_PI * x * 5.0f),
+			cosf((float)M_PI * x * 5.0f), 0, 0, 0, 0, (float)((g & 3) < 3 ? g + 1 : g), (float)(g & 3), 0,
+		};
+		for (unsigned i = 0; i < 4; i++) {
+			int8_t byte = (int8_t)(packed >> (8 * i));
+			want[5 + i] = fmaxf((float)byte / 127.0f, -1.0f);
+		}
+		for (unsigned i = 0; i < 11; i++) {
+			float tol = i < 5 ? 2e-3f * fmaxf(1.0f, fabsf(want[i])) : 1e-6f;
+			if (!(fabsf(f[g * 12 + i] - want[i]) <= tol) && bad[i]++ == 0) {
+				[first appendFormat:@"%s at thread %u: %g, not %g; ", names[i], g, f[g * 12 + i], want[i]];
+			}
+		}
+		uint32_t a = g * 1000u, c = 0xfffffff0u - g;
+		uint32_t rh = (uint32_t)(((uint64_t)a + c + 1) >> 1);
+		int32_t h = (int32_t)(((int64_t)((int)g - 40) + (-7)) >> 1);
+		if (u[g * 2] != rh && bad[11]++ == 0) {
+			[first appendFormat:@"rhadd at thread %u: %u, not %u; ", g, u[g * 2], rh];
+		}
+		if (u[g * 2 + 1] != (uint32_t)h && bad[12]++ == 0) {
+			[first appendFormat:@"hadd at thread %u: %d, not %d; ", g, (int32_t)u[g * 2 + 1], h];
+		}
+	}
+	for (unsigned i = 0; i < 13; i++) {
+		total += bad[i];
+	}
+	[t note:@"64 threads: atanh %u, asinh %u, acosh %u, sinpi %u, cospi %u, unpack_snorm4x8 %u, quad_shuffle_down %u, "
+	    "thread_index_in_quadgroup %u, rhadd %u, hadd %u wrong", bad[0], bad[1], bad[2], bad[3], bad[4],
+	    bad[5] + bad[6] + bad[7] + bad[8], bad[9], bad[10], bad[11], bad[12]];
+	if (total) {
+		[t fail:@"%@%u wrong values", first, total];
+		return;
+	}
+	[t pass:@"atanh, asinh, acosh, sinpi, cospi (within 0.2%%), unpack_snorm4x8_to_float, quad_shuffle_down, "
+	    "thread_index_in_quadgroup, rhadd and hadd right over 64 threads"];
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -8522,6 +8630,7 @@ static const struct {
 	{ "metal.simd", test_metal_simd },
 	{ "metal.dispatch.nonuniform", test_metal_nonuniform },
 	{ "metal.dispatch.nonuniform.grid", test_metal_nonuniform_grid },
+	{ "metal.functions.more", test_metal_more_functions },
 	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.msaa.drawable", test_metal_msaa_drawable },
