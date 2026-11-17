@@ -8821,6 +8821,108 @@ test_metal_cube_write(MetalTest *t)
 	    "by face"];
 }
 
+/*
+ * A point sprite: one point of [[point_size]] 32 at the centre of a 64x64 target, its fragment shader returning
+ * [[point_coord]] as red and green -- what SpriteKit's particles and point-sprite shaders read. The coordinate runs
+ * from 0 at the point's top left to 1 at its bottom right. And clz in a kernel (count_leading_zeros), which SceneKit's
+ * depth kernels use. The K40 port's GPU compiler had neither until 11-17 night.
+ */
+static NSString *const kPointCoordSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct PtOut { float4 pos [[position]]; float size [[point_size]]; };\n"
+"vertex PtOut v_pt(uint vid [[vertex_id]]) { PtOut o; o.pos = float4(0.0, 0.0, 0.0, 1.0); o.size = 32.0; return o; }\n"
+"fragment float4 f_pt(float2 pc [[point_coord]]) { return float4(pc.x, pc.y, 0.0, 1.0); }\n"
+"kernel void k_clz(device uint *out [[buffer(0)]], uint gid [[thread_position_in_grid]]) {\n"
+"    uint v = gid == 0u ? 0u : (1u << (gid - 1u)) | (gid & 1u);\n"
+"    out[gid] = clz(v);\n"
+"    out[64u + gid] = uint(clz(ushort(v)));\n"
+"}\n";
+
+static void
+test_metal_point_coord(MetalTest *t)
+{
+	enum { S = 64 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kPointCoordSource options:nil error:&error];
+	if (lib == nil) {
+		[t fail:@"the shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+	pd.vertexFunction = [lib newFunctionWithName:@"v_pt"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"f_pt"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
+	id<MTLRenderPipelineState> rp = [g_device newRenderPipelineStateWithDescriptor:pd error:&error];
+	id<MTLComputePipelineState> kc = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_clz"]
+	    error:&error];
+	if (rp == nil || kc == nil) {
+		[t fail:@"a pipeline was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                                             width:S height:S mipmapped:NO];
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	d.storageMode = MTLStorageModeShared;
+	id<MTLTexture> target = [g_device newTextureWithDescriptor:d];
+	id<MTLBuffer> cb = [g_device newBufferWithLength:128 * 4 options:MTLResourceStorageModeShared];
+	memset(cb.contents, 0xff, cb.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	MTLRenderPassDescriptor *rd = [MTLRenderPassDescriptor renderPassDescriptor];
+	rd.colorAttachments[0].texture = target;
+	rd.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rd.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+	id<MTLRenderCommandEncoder> re = [b renderCommandEncoderWithDescriptor:rd];
+	[re setRenderPipelineState:rp];
+	[re drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:1];
+	[re endEncoding];
+	id<MTLComputeCommandEncoder> ce = [b computeCommandEncoder];
+	[ce setComputePipelineState:kc];
+	[ce setBuffer:cb offset:0 atIndex:0];
+	[ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(33, 1, 1)];
+	[ce endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	uint8_t px[S * S * 4];
+	[target getBytes:px bytesPerRow:S * 4 fromRegion:MTLRegionMake2D(0, 0, S, S) mipmapLevel:0];
+	const uint8_t *tl = px + (17 * S + 17) * 4, *tr = px + (17 * S + 46) * 4, *bl = px + (46 * S + 17) * 4,
+	              *br = px + (46 * S + 46) * 4, *out = px + (4 * S + 4) * 4;
+	bool corners = tl[0] < 48 && tl[1] < 48 && tr[0] > 207 && tr[1] < 48 && bl[0] < 48 && bl[1] > 207 &&
+	               br[0] > 207 && br[1] > 207 && out[2] == 255 && out[0] == 0;
+	const uint32_t *o = cb.contents;
+	unsigned bad_clz = 0;
+	NSMutableString *first = [NSMutableString string];
+	for (unsigned g = 0; g < 33; g++) {
+		uint32_t v = g == 0 ? 0 : (1u << (g - 1)) | (g & 1);
+		uint32_t w32 = v == 0 ? 32 : (uint32_t)__builtin_clz(v);
+		uint16_t v16 = (uint16_t)v;
+		uint32_t w16 = v16 == 0 ? 16 : (uint32_t)__builtin_clz(v16) - 16;
+		if ((o[g] != w32 || o[64 + g] != w16) && bad_clz++ == 0) {
+			[first appendFormat:@"clz at %u: %u / %u, not %u / %u; ", g, o[g], o[64 + g], w32, w16];
+		}
+	}
+	[t note:@"the point's corners (R,G): top left %u,%u, top right %u,%u, bottom left %u,%u, bottom right %u,%u; "
+	    "outside %u,%u,%u; clz %u wrong of 33", tl[0], tl[1], tr[0], tr[1], bl[0], bl[1], br[0], br[1], out[0], out[1],
+	    out[2], bad_clz];
+	if (!corners || bad_clz) {
+		[t fail:@"%@%@", corners ? @"" : @"the point's coordinate does not run from its top left to its bottom right; ",
+		    first];
+		return;
+	}
+	[t pass:@"a 32-pixel point sprite's [[point_coord]] from 0 at its top left to 1 at its bottom right, and clz of "
+	    "32- and 16-bit values"];
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -8906,6 +9008,7 @@ static const struct {
 	{ "metal.pointer.loop", test_metal_pointer_loop },
 	{ "metal.bitcast.repack", test_metal_repack },
 	{ "metal.cube.write", test_metal_cube_write },
+	{ "metal.point.coord", test_metal_point_coord },
 	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.msaa.drawable", test_metal_msaa_drawable },
