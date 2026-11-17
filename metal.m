@@ -8923,6 +8923,116 @@ test_metal_point_coord(MetalTest *t)
 	    "32- and 16-bit values"];
 }
 
+/*
+ * Program-scope constant arrays read at run-time indices -- `constant float W[7] = {...}` and the like, what a
+ * Gaussian blur's weights and offsets are (Telegram's camera and call-screen blurs), plus an array of structs mixing
+ * float, ushort, uchar and half (member layout) and of float3 (16-byte elements). The K40 port's translator put such
+ * arrays in scratch memory and never wrote their initializers there until 11-18: every run-time-indexed read was
+ * uninitialised private memory. And ctz / popcount of 16- and 8-bit values, which it built at the wrong width.
+ */
+static NSString *const kConstArraySource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"constant float W[7] = { 0.0625f, 0.125f, 0.1875f, 0.25f, 0.3125f, 0.375f, 0.4375f };\n"
+"constant uint T[13] = { 2u, 3u, 5u, 7u, 11u, 13u, 17u, 19u, 23u, 29u, 31u, 37u, 41u };\n"
+"struct P { float f; ushort s; uchar c; half h; };\n"
+"constant P PS[5] = { { 1.5f, 100, 7, 0.25h }, { 2.5f, 200, 8, 0.5h }, { 3.5f, 300, 9, 0.75h },\n"
+"                     { 4.5f, 400, 10, 1.0h }, { 5.5f, 500, 11, 1.25h } };\n"
+"constant float3 V3[3] = { float3(1.0f, 2.0f, 3.0f), float3(4.0f, 5.0f, 6.0f), float3(7.0f, 8.0f, 9.0f) };\n"
+"kernel void k_const(device float *out [[buffer(0)]], device uint *iout [[buffer(1)]],\n"
+"    uint gid [[thread_position_in_grid]]) {\n"
+"    uint i = gid % 7u, j = gid % 13u, k = gid % 5u, m = gid % 3u;\n"
+"    out[gid * 4u + 0u] = W[i];\n"
+"    out[gid * 4u + 1u] = PS[k].f + float(PS[k].h);\n"
+"    float3 v = V3[m];\n"
+"    out[gid * 4u + 2u] = v.x * 100.0f + v.y * 10.0f + v.z;\n"
+"    out[gid * 4u + 3u] = float(T[j]);\n"
+"    iout[gid * 4u + 0u] = uint(PS[k].s) * 1000u + uint(PS[k].c);\n"
+"    ushort x = ushort((gid * 2654435761u) >> 16);\n"
+"    iout[gid * 4u + 1u] = uint(ctz(x));\n"
+"    iout[gid * 4u + 2u] = uint(popcount(x));\n"
+"    uchar y = uchar(gid * 37u);\n"
+"    iout[gid * 4u + 3u] = uint(ctz(y)) * 100u + uint(popcount(y));\n"
+"}\n";
+
+static void
+test_metal_const_array(MetalTest *t)
+{
+	enum { N = 64 };
+	static const float w[7] = { 0.0625f, 0.125f, 0.1875f, 0.25f, 0.3125f, 0.375f, 0.4375f };
+	static const uint32_t tt[13] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41 };
+	static const float pf[5] = { 1.75f, 3.0f, 4.25f, 5.5f, 6.75f };     /* PS[k].f + PS[k].h */
+	static const uint32_t ps[5] = { 100007, 200008, 300009, 400010, 500011 };
+	static const float v3[3] = { 123.0f, 456.0f, 789.0f };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kConstArraySource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_const"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> out = [g_device newBufferWithLength:N * 4 * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> iout = [g_device newBufferWithLength:N * 4 * 4 options:MTLResourceStorageModeShared];
+	memset(out.contents, 0xff, out.length);
+	memset(iout.contents, 0xff, iout.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e setBuffer:iout offset:0 atIndex:1];
+	[e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const float *o = out.contents;
+	const uint32_t *io = iout.contents;
+	unsigned bad_arrays = 0, bad_bits = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned g = 0; g < N; g++) {
+		float fw[4] = { w[g % 7], pf[g % 5], v3[g % 3], (float)tt[g % 13] };
+		for (unsigned i = 0; i < 4; i++) {
+			if (o[g * 4 + i] != fw[i] && bad_arrays++ == 0) {
+				[first appendFormat:@"thread %u float %u: %g, not %g; ", g, i, o[g * 4 + i], fw[i]];
+			}
+		}
+		if (io[g * 4] != ps[g % 5] && bad_arrays++ == 0) {
+			[first appendFormat:@"thread %u struct's ushort/uchar: %u, not %u; ", g, io[g * 4], ps[g % 5]];
+		}
+		uint16_t x = (uint16_t)((g * 2654435761u) >> 16);
+		uint8_t y = (uint8_t)(g * 37u);
+		uint32_t want[3] = {
+			x == 0 ? 16u : (uint32_t)__builtin_ctz(x), (uint32_t)__builtin_popcount(x),
+			(y == 0 ? 8u : (uint32_t)__builtin_ctz(y)) * 100u + (uint32_t)__builtin_popcount(y),
+		};
+		for (unsigned i = 0; i < 3; i++) {
+			if (io[g * 4 + 1 + i] != want[i] && bad_bits++ == 0) {
+				[first appendFormat:@"thread %u %s: %u, not %u; ", g,
+				    i == 0 ? "ctz(ushort)" : i == 1 ? "popcount(ushort)" : "ctz/popcount(uchar)", io[g * 4 + 1 + i],
+				    want[i]];
+			}
+		}
+	}
+	[t note:@"64 threads: %u wrong reads of constant arrays (float, uint, float3, a struct of float/ushort/uchar/half), "
+	    "%u wrong 16-/8-bit ctz or popcount", bad_arrays, bad_bits];
+	if (bad_arrays || bad_bits) {
+		[t fail:@"%@", first];
+		return;
+	}
+	[t pass:@"program-scope constant arrays of float, uint, float3 and a mixed struct read at run-time indices, and ctz "
+	    "/ popcount of 16- and 8-bit values, over 64 threads"];
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -9009,6 +9119,7 @@ static const struct {
 	{ "metal.bitcast.repack", test_metal_repack },
 	{ "metal.cube.write", test_metal_cube_write },
 	{ "metal.point.coord", test_metal_point_coord },
+	{ "metal.const.array", test_metal_const_array },
 	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.msaa.drawable", test_metal_msaa_drawable },
