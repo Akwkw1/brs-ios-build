@@ -8338,6 +8338,109 @@ test_metal_nonuniform(MetalTest *t)
 	    "group's size, and 1000 in groups of 64 (an edge of 40) through a threadgroup barrier"];
 }
 
+/*
+ * The grid's shape as a kernel sees it under -dispatchThreads: with non-uniform threadgroups --
+ * threadgroup_position_in_grid, threadgroups_per_grid and threads_per_grid of the WHOLE grid in every threadgroup,
+ * the smaller edge ones too -- and the same kernel under -dispatchThreadgroups:. A driver that runs a non-uniform
+ * grid as launches of pieces gets these wrong unless every piece is told the grid (the K40 port dropped such a
+ * kernel until 11-17 evening). 100x37 threads in 16x16 groups: group (x/16, y/16) of 7x3, 100x37 threads, groups of
+ * 16 or 4 by 16 or 5; then 3x2 groups of 8x4.
+ */
+static NSString *const kNonUniformGridSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_nu_grid(device uint4 *out [[buffer(0)]], constant uint &w [[buffer(1)]],\n"
+"    uint2 gid [[thread_position_in_grid]], uint2 tg [[threadgroup_position_in_grid]],\n"
+"    uint2 tgs [[threadgroups_per_grid]], uint2 tpg [[threads_per_grid]],\n"
+"    uint2 tpt [[threads_per_threadgroup]]) {\n"
+"    uint i = gid.y * w + gid.x;\n"
+"    out[2u * i] = uint4(tg, tgs);\n"
+"    out[2u * i + 1u] = uint4(tpg, tpt);\n"
+"}\n";
+
+static void
+test_metal_nonuniform_grid(MetalTest *t)
+{
+	enum { W = 100, H = 37, GW = 24, GH = 8, GUARD = 16 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kNonUniformGridSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_nu_grid"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> out = [g_device newBufferWithLength:(W * H * 2 + GUARD) * 16 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> outu = [g_device newBufferWithLength:(GW * GH * 2 + GUARD) * 16 options:MTLResourceStorageModeShared];
+	uint32_t w = W, wu = GW;
+
+	memset(out.contents, 0xff, out.length);
+	memset(outu.contents, 0xff, outu.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e setBytes:&w length:sizeof(w) atIndex:1];
+	[e dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+	[e setBuffer:outu offset:0 atIndex:0];
+	[e setBytes:&wu length:sizeof(wu) atIndex:1];
+	[e dispatchThreadgroups:MTLSizeMake(3, 2, 1) threadsPerThreadgroup:MTLSizeMake(8, 4, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const uint32_t *o = out.contents, *ou = outu.contents;
+	unsigned unwritten = 0, wrong = 0, wrongu = 0, outside = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned y = 0; y < H; y++) {
+		for (unsigned x = 0; x < W; x++) {
+			const uint32_t *v = o + (y * W + x) * 8;
+			const uint32_t want[8] = { x / 16, y / 16, 7, 3, W, H, x < 96 ? 16 : 4, y < 32 ? 16 : 5 };
+
+			if (v[0] == 0xffffffffu) {
+				unwritten++;
+			} else if (memcmp(v, want, sizeof(want)) != 0 && wrong++ == 0) {
+				[first appendFormat:@"(%u,%u) saw group (%u,%u) of %ux%u, %ux%u threads, groups of %ux%u -- not "
+				    "(%u,%u) of %ux%u, %ux%u, %ux%u; ", x, y, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+				    want[0], want[1], want[2], want[3], want[4], want[5], want[6], want[7]];
+			}
+		}
+	}
+	for (unsigned y = 0; y < GH; y++) {
+		for (unsigned x = 0; x < GW; x++) {
+			const uint32_t *v = ou + (y * GW + x) * 8;
+			const uint32_t want[8] = { x / 8, y / 4, 3, 2, GW, GH, 8, 4 };
+
+			if (memcmp(v, want, sizeof(want)) != 0 && wrongu++ == 0) {
+				[first appendFormat:@"threadgroups (%u,%u) saw group (%u,%u) of %ux%u, %ux%u threads, groups of "
+				    "%ux%u; ", x, y, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]];
+			}
+		}
+	}
+	for (unsigned i = 0; i < GUARD * 4; i++) {
+		outside += o[W * H * 8 + i] != 0xffffffffu;
+		outside += ou[GW * GH * 8 + i] != 0xffffffffu;
+	}
+	[t note:@"100x37 in 16x16: %u unwritten, %u with a wrong grid shape; 3x2 groups of 8x4: %u wrong; %u words "
+	    "written past the grids", unwritten, wrong, wrongu, outside];
+	if (unwritten || wrong || wrongu || outside) {
+		[t fail:@"%@%u unwritten, %u + %u wrong, %u past the grids", first, unwritten, wrong, wrongu, outside];
+		return;
+	}
+	[t pass:@"the grid's shape in every threadgroup of a non-uniform 100x37 grid in 16x16 groups (7x3 groups, the "
+	    "edge ones 4 and 5 wide) and of 3x2 groups of 8x4: threadgroup_position_in_grid, threadgroups_per_grid, "
+	    "threads_per_grid, threads_per_threadgroup"];
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -8418,6 +8521,7 @@ static const struct {
 	{ "metal.setbytes.many", test_metal_setbytes_many },
 	{ "metal.simd", test_metal_simd },
 	{ "metal.dispatch.nonuniform", test_metal_nonuniform },
+	{ "metal.dispatch.nonuniform.grid", test_metal_nonuniform_grid },
 	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.msaa.drawable", test_metal_msaa_drawable },
