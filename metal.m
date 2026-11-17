@@ -8228,6 +8228,116 @@ test_metal_simd(MetalTest *t)
 	[t pass:@"14 SIMD-group and quad functions right over %u threads in groups of %u", N, width];
 }
 
+/*
+ * -dispatchThreads: with a grid that does not divide into its threadgroups -- Metal's non-uniform threadgroups, on
+ * every GPU this API runs on: the groups at the far edges are smaller, and threads_per_threadgroup says how big.
+ * Apple's documentation shows exactly this for image kernels, and a driver without it runs nothing at all (the K40
+ * port until 11-17: "do not divide into groups ... dropped"). Two kernels: a 100x37 grid in 16x16 groups, every
+ * element counted (written once, none outside) with the group size its thread saw; and a 1000-thread grid in groups
+ * of 64 whose threads pass a value through threadgroup memory across a barrier -- the 40-thread edge group too.
+ */
+static NSString *const kNonUniformSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_nu2d(device uint *out [[buffer(0)]], constant uint &w [[buffer(1)]],\n"
+"    uint2 gid [[thread_position_in_grid]], uint2 tpt [[threads_per_threadgroup]]) {\n"
+"    uint i = gid.y * w + gid.x;\n"
+"    out[i] = out[i] + 1u + (tpt.x << 8) + (tpt.y << 16);\n"
+"}\n"
+"kernel void k_nu1d(device uint *out [[buffer(0)]], uint gid [[thread_position_in_grid]],\n"
+"    uint lid [[thread_position_in_threadgroup]], uint tpt [[threads_per_threadgroup]]) {\n"
+"    threadgroup uint shared[64];\n"
+"    shared[lid] = gid;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    out[gid] = shared[(lid + 1u) % tpt] + 1u;\n"
+"}\n";
+
+static void
+test_metal_nonuniform(MetalTest *t)
+{
+	enum { W = 100, H = 37, GUARD = 64, N1 = 1000 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kNonUniformSource options:nil error:&error];
+	if (lib == nil) {
+		[t fail:@"the kernels did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLComputePipelineState> k2 = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_nu2d"]
+	    error:&error];
+	id<MTLComputePipelineState> k1 = k2 == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_nu1d"] error:&error];
+	if (k2 == nil || k1 == nil) {
+		[t fail:@"a pipeline was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> out2 = [g_device newBufferWithLength:(W * H + GUARD) * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out1 = [g_device newBufferWithLength:(N1 + GUARD) * 4 options:MTLResourceStorageModeShared];
+	uint32_t w = W;
+
+	memset(out2.contents, 0, out2.length);
+	memset(out1.contents, 0, out1.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k2];
+	[e setBuffer:out2 offset:0 atIndex:0];
+	[e setBytes:&w length:sizeof(w) atIndex:1];
+	[e dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+	[e setComputePipelineState:k1];
+	[e setBuffer:out1 offset:0 atIndex:0];
+	[e dispatchThreads:MTLSizeMake(N1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const uint32_t *o2 = out2.contents, *o1 = out1.contents;
+	unsigned unwritten = 0, twice = 0, sized = 0, outside = 0, bad1 = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned y = 0; y < H; y++) {
+		for (unsigned x = 0; x < W; x++) {
+			uint32_t v = o2[y * W + x];
+			uint32_t want = 1u + ((x < 96 ? 16u : 4u) << 8) + ((y < 32 ? 16u : 5u) << 16);
+
+			if ((v & 0xff) == 0) {
+				unwritten++;
+			} else if ((v & 0xff) != 1) {
+				twice++;
+			} else if (v != want && sized++ == 0) {
+				[first appendFormat:@"(%u,%u) saw groups of %ux%u, not %ux%u; ", x, y, (v >> 8) & 0xff, v >> 16,
+				    (want >> 8) & 0xff, want >> 16];
+			}
+		}
+	}
+	for (unsigned i = 0; i < GUARD; i++) {
+		outside += o2[W * H + i] != 0;
+		outside += o1[N1 + i] != 0;
+	}
+	for (unsigned g = 0; g < N1; g++) {
+		unsigned base = g / 64 * 64, tpt = base + 64 <= N1 ? 64 : N1 - base, lid = g - base;
+		uint32_t want = base + (lid + 1) % tpt + 1;
+
+		if (o1[g] != want && bad1++ == 0) {
+			[first appendFormat:@"1D thread %u read %u through the barrier, not %u; ", g, o1[g], want];
+		}
+	}
+	[t note:@"100x37 in 16x16: %u unwritten, %u written twice, %u with a wrong group size; 1000 in 64s: %u wrong; %u "
+	    "words written past the grids", unwritten, twice, sized, bad1, outside];
+	if (unwritten || twice || sized || bad1 || outside) {
+		[t fail:@"%@%u unwritten, %u twice, %u past the grids", first, unwritten, twice, outside];
+		return;
+	}
+	[t pass:@"non-uniform threadgroups: 100x37 threads in 16x16 groups (edges 4 and 5 wide) each run once with its "
+	    "group's size, and 1000 in groups of 64 (an edge of 40) through a threadgroup barrier"];
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -8307,6 +8417,7 @@ static const struct {
 	{ "metal.dontcare", test_metal_dontcare },
 	{ "metal.setbytes.many", test_metal_setbytes_many },
 	{ "metal.simd", test_metal_simd },
+	{ "metal.dispatch.nonuniform", test_metal_nonuniform },
 	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.msaa.drawable", test_metal_msaa_drawable },
