@@ -8549,6 +8549,278 @@ test_metal_more_functions(MetalTest *t)
 	    "thread_index_in_quadgroup, rhadd and hadd right over 64 threads"];
 }
 
+/*
+ * Pointers walked through memory in a loop -- `p += stride` each iteration, which the compiler leaves as a pointer
+ * carried around the loop (an LLVM phi of pointers): a device buffer read, a device buffer written through a
+ * pointer it advances, and threadgroup memory read the same way. The K40 port's translator refused that until 11-17
+ * evening (81 of the iOS 16.5 image's entry points).
+ */
+static NSString *const kPointerLoopSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_walk(device const float *in [[buffer(0)]], device float *out [[buffer(1)]],\n"
+"    constant uint &n [[buffer(2)]], uint gid [[thread_position_in_grid]],\n"
+"    uint lid [[thread_position_in_threadgroup]]) {\n"
+"    threadgroup float shared[64 * 4];\n"
+"    device const float *p = in + gid * 16u;\n"
+"    float s = 0.0f;\n"
+"    for (uint i = 0; i < n; i++) { s += *p * float(i + 1u); p += 1; }\n"
+"    device float *q = out + gid * 8u;\n"
+"    for (uint i = 0; i < n / 2u; i++) { *q = s + float(i); q += 1; }\n"
+"    threadgroup float *t = shared + lid * 4u;\n"
+"    for (uint i = 0; i < 4u; i++) { *t = float(gid * 4u + i); t += 1; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    threadgroup const float *r = shared + ((lid + 1u) % 64u) * 4u;\n"
+"    float w = 0.0f;\n"
+"    for (uint i = 0; i < 4u; i++) { w += *r; r += 1; }\n"
+"    out[64u * 8u + gid] = w;\n"
+"}\n";
+
+static void
+test_metal_pointer_loop(MetalTest *t)
+{
+	enum { N = 64, LEN = 16 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kPointerLoopSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_walk"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> in = [g_device newBufferWithLength:N * LEN * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [g_device newBufferWithLength:(N * 8 + N) * 4 options:MTLResourceStorageModeShared];
+	float *pin = in.contents;
+	for (unsigned i = 0; i < N * LEN; i++) {
+		pin[i] = (float)((i * 7) % 13) - 6.0f;
+	}
+	memset(out.contents, 0, out.length);
+	uint32_t n = 14;
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setBuffer:in offset:0 atIndex:0];
+	[e setBuffer:out offset:0 atIndex:1];
+	[e setBytes:&n length:sizeof(n) atIndex:2];
+	[e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const float *o = out.contents;
+	unsigned bad_read = 0, bad_write = 0, bad_shared = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned g = 0; g < N; g++) {
+		float s = 0.0f;
+		for (unsigned i = 0; i < n; i++) {
+			s += pin[g * LEN + i] * (float)(i + 1);
+		}
+		for (unsigned i = 0; i < 8; i++) {
+			float want = i < n / 2 ? s + (float)i : 0.0f;
+			if (o[g * 8 + i] != want && (i == 0 ? bad_read++ : bad_write++) == 0) {
+				[first appendFormat:@"thread %u word %u: %g, not %g; ", g, i, o[g * 8 + i], want];
+			}
+		}
+		unsigned src = (g + 1) % N;
+		float w = (float)(src * 4 * 4 + 6);
+		if (o[N * 8 + g] != w && bad_shared++ == 0) {
+			[first appendFormat:@"thread %u's threadgroup walk: %g, not %g; ", g, o[N * 8 + g], w];
+		}
+	}
+	[t note:@"64 threads: %u wrong sums read through a device pointer, %u wrong words written through one, %u wrong "
+	    "threadgroup walks", bad_read, bad_write, bad_shared];
+	if (bad_read || bad_write || bad_shared) {
+		[t fail:@"%@", first];
+		return;
+	}
+	[t pass:@"pointers advanced in loops: 14 floats read through a device pointer, 7 written through another, 4 "
+	    "through threadgroup memory, in each of 64 threads"];
+}
+
+/*
+ * as_type<> between vectors of different lane widths -- the bitcasts a compiler emits for it: uint to uchar4,
+ * uchar4 to uint, ushort4 to uint2 and back, ushort to uchar2. Lane 0 is the lowest bits on every GPU this API runs
+ * on (little-endian). The K40 port's translator refused most of these shapes until 11-17 evening (33 of the iOS 16.5
+ * image's entry points).
+ */
+static NSString *const kRepackSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_repack(device const uint *in [[buffer(0)]], device uint *out [[buffer(1)]],\n"
+"    uint gid [[thread_position_in_grid]]) {\n"
+"    uint a = in[gid * 2u], b = in[gid * 2u + 1u];\n"
+"    uchar4 c = as_type<uchar4>(a);\n"
+"    uint o = gid * 8u;\n"
+"    out[o + 0u] = uint(c.x) | (uint(c.y) << 8) | (uint(c.z) << 16) | (uint(c.w) << 24);\n"
+"    out[o + 1u] = uint(c.y) + uint(c.w) * 3u;\n"
+"    out[o + 2u] = as_type<uint>(uchar4(c.w, c.z, c.y, c.x));\n"
+"    ushort4 s = as_type<ushort4>(uint2(a, b));\n"
+"    out[o + 3u] = uint(s.x) + uint(s.y) * 5u + uint(s.z) * 7u + uint(s.w) * 11u;\n"
+"    uint2 r = as_type<uint2>(ushort4(s.w, s.z, s.y, s.x));\n"
+"    out[o + 4u] = r.x;\n"
+"    out[o + 5u] = r.y;\n"
+"    uchar2 h = as_type<uchar2>(ushort(a >> 7));\n"
+"    out[o + 6u] = uint(h.x) * 1000u + uint(h.y);\n"
+"    out[o + 7u] = uint(as_type<ushort>(uchar2(h.y, h.x)));\n"
+"}\n";
+
+static void
+test_metal_repack(MetalTest *t)
+{
+	enum { N = 64 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kRepackSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_repack"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> in = [g_device newBufferWithLength:N * 2 * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [g_device newBufferWithLength:N * 8 * 4 options:MTLResourceStorageModeShared];
+	uint32_t *pin = in.contents;
+	for (unsigned i = 0; i < N * 2; i++) {
+		pin[i] = 0x9e3779b9u * (i + 1) ^ (i << 13);
+	}
+	memset(out.contents, 0, out.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setBuffer:in offset:0 atIndex:0];
+	[e setBuffer:out offset:0 atIndex:1];
+	[e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const uint32_t *o = out.contents;
+	unsigned bad = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned g = 0; g < N; g++) {
+		uint32_t a = pin[g * 2], bb = pin[g * 2 + 1];
+		uint8_t c[4] = { (uint8_t)a, (uint8_t)(a >> 8), (uint8_t)(a >> 16), (uint8_t)(a >> 24) };
+		uint16_t s[4] = { (uint16_t)a, (uint16_t)(a >> 16), (uint16_t)bb, (uint16_t)(bb >> 16) };
+		uint16_t hv = (uint16_t)(a >> 7);
+		uint8_t h[2] = { (uint8_t)hv, (uint8_t)(hv >> 8) };
+		uint32_t want[8] = {
+			a, (uint32_t)c[1] + (uint32_t)c[3] * 3u,
+			(uint32_t)c[3] | (uint32_t)c[2] << 8 | (uint32_t)c[1] << 16 | (uint32_t)c[0] << 24,
+			(uint32_t)s[0] + s[1] * 5u + s[2] * 7u + s[3] * 11u,
+			(uint32_t)s[3] | (uint32_t)s[2] << 16, (uint32_t)s[1] | (uint32_t)s[0] << 16,
+			(uint32_t)h[0] * 1000u + h[1], (uint32_t)h[1] | (uint32_t)h[0] << 8,
+		};
+		for (unsigned i = 0; i < 8; i++) {
+			if (o[g * 8 + i] != want[i] && bad++ == 0) {
+				[first appendFormat:@"thread %u word %u: 0x%08x, not 0x%08x; ", g, i, o[g * 8 + i], want[i]];
+			}
+		}
+	}
+	[t note:@"64 threads x 8 words: %u wrong", bad];
+	if (bad) {
+		[t fail:@"%@%u wrong words", first, bad];
+		return;
+	}
+	[t pass:@"as_type between uint and uchar4, uint2 and ushort4, ushort and uchar2, both ways, lane 0 the low bits, "
+	    "over 64 threads"];
+}
+
+/*
+ * A kernel writing every face of a cube texture (texturecube<float, access::write>::write(color, uint2, face)) --
+ * what an environment map's prefiltering does (SceneKit's and VFX's kernels in iOS 16.5) -- read back face by face
+ * with -getBytes:...slice:. The K40 port's translator refused the write until 11-17 evening.
+ */
+static NSString *const kCubeWriteSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_cube(texturecube<float, access::write> cube [[texture(0)]],\n"
+"    uint3 gid [[thread_position_in_grid]]) {\n"
+"    cube.write(float4(float(gid.x) / 255.0f, float(gid.y) / 255.0f, float(gid.z * 40u) / 255.0f, 1.0f),\n"
+"               gid.xy, gid.z);\n"
+"}\n";
+
+static void
+test_metal_cube_write(MetalTest *t)
+{
+	enum { S = 8 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kCubeWriteSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_cube"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	MTLTextureDescriptor *d = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                                                 size:S mipmapped:NO];
+	d.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+	d.storageMode = MTLStorageModeShared;
+	id<MTLTexture> cube = [g_device newTextureWithDescriptor:d];
+	if (cube == nil) {
+		[t fail:@"no %ux%u cube texture", S, S];
+		return;
+	}
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setTexture:cube atIndex:0];
+	[e dispatchThreadgroups:MTLSizeMake(1, 1, 6) threadsPerThreadgroup:MTLSizeMake(S, S, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	unsigned bad = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned face = 0; face < 6; face++) {
+		uint8_t px[S * S * 4];
+		memset(px, 0, sizeof(px));
+		[cube getBytes:px bytesPerRow:S * 4 bytesPerImage:S * S * 4 fromRegion:MTLRegionMake2D(0, 0, S, S)
+		   mipmapLevel:0 slice:face];
+		for (unsigned y = 0; y < S; y++) {
+			for (unsigned x = 0; x < S; x++) {
+				const uint8_t *p = px + (y * S + x) * 4;
+				if ((p[0] != x || p[1] != y || p[2] != face * 40 || p[3] != 255) && bad++ == 0) {
+					[first appendFormat:@"face %u (%u,%u): %u,%u,%u,%u, not %u,%u,%u,255; ", face, x, y, p[0], p[1],
+					    p[2], p[3], x, y, face * 40];
+				}
+			}
+		}
+	}
+	[t note:@"6 faces of 8x8: %u texels wrong", bad];
+	if (bad) {
+		[t fail:@"%@%u wrong texels", first, bad];
+		return;
+	}
+	[t pass:@"a kernel wrote all six faces of an 8x8 cube texture (texturecube::write with a face), read back face "
+	    "by face"];
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -8631,6 +8903,9 @@ static const struct {
 	{ "metal.dispatch.nonuniform", test_metal_nonuniform },
 	{ "metal.dispatch.nonuniform.grid", test_metal_nonuniform_grid },
 	{ "metal.functions.more", test_metal_more_functions },
+	{ "metal.pointer.loop", test_metal_pointer_loop },
+	{ "metal.bitcast.repack", test_metal_repack },
+	{ "metal.cube.write", test_metal_cube_write },
 	{ "metal.occlusion", test_metal_occlusion },
 	{ "metal.msaa.memoryless", test_metal_msaa_memoryless },
 	{ "metal.msaa.drawable", test_metal_msaa_drawable },
