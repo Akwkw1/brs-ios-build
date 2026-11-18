@@ -8822,6 +8822,102 @@ test_metal_cube_write(MetalTest *t)
 }
 
 /*
+ * Compare-exchange on device memory (atomic_compare_exchange_weak_explicit): 64 threads adding 1 to one counter by a
+ * retry loop -- the shape every lock-free GPU structure has -- and per thread a compare that must fail (its `expected`
+ * then holds the value it found) and one that must succeed. MLCompute's gradient and scatter kernels use it. The K40
+ * port's translator refused it until 11-18: nothing could show a wrong one, and this is that check.
+ */
+static NSString *const kCasSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_cas(device atomic_uint *counter [[buffer(0)]], device atomic_uint *slots [[buffer(1)]],\n"
+"    device uint *out [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+"    uint e = atomic_load_explicit(&counter[0], memory_order_relaxed);\n"
+"    while (!atomic_compare_exchange_weak_explicit(&counter[0], &e, e + 1u, memory_order_relaxed,\n"
+"                                                 memory_order_relaxed)) {\n"
+"    }\n"
+"    uint f = gid * 3u + 1u;\n"
+"    bool failed = !atomic_compare_exchange_weak_explicit(&slots[gid], &f, 999u, memory_order_relaxed,\n"
+"                                                         memory_order_relaxed);\n"
+"    bool ok = false;\n"
+"    for (int i = 0; i < 16 && !ok; i++) {\n"
+"        uint s = gid * 3u;\n"
+"        ok = atomic_compare_exchange_weak_explicit(&slots[64u + gid], &s, gid + 1000u, memory_order_relaxed,\n"
+"                                                   memory_order_relaxed);\n"
+"    }\n"
+"    out[gid * 3u + 0u] = failed ? 1u : 0u;\n"
+"    out[gid * 3u + 1u] = f;\n"
+"    out[gid * 3u + 2u] = ok ? 1u : 0u;\n"
+"}\n";
+
+static void
+test_metal_atomic_cmpxchg(MetalTest *t)
+{
+	enum { N = 64 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kCasSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_cas"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> counter = [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> slots = [g_device newBufferWithLength:2 * N * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [g_device newBufferWithLength:N * 3 * 4 options:MTLResourceStorageModeShared];
+	memset(counter.contents, 0, counter.length);
+	uint32_t *ps = slots.contents;
+	for (unsigned i = 0; i < N; i++) {
+		ps[i] = i * 3;
+		ps[N + i] = i * 3;
+	}
+	memset(out.contents, 0xff, out.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setBuffer:counter offset:0 atIndex:0];
+	[e setBuffer:slots offset:0 atIndex:1];
+	[e setBuffer:out offset:0 atIndex:2];
+	[e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const uint32_t *o = out.contents, *c = counter.contents;
+	unsigned bad = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	if (c[0] != N && bad++ == 0) {
+		[first appendFormat:@"the counter is %u after %u retry-loop increments; ", c[0], N];
+	}
+	for (unsigned g = 0; g < N; g++) {
+		if ((o[g * 3] != 1 || o[g * 3 + 1] != g * 3 || ps[g] != g * 3) && bad++ == 0) {
+			[first appendFormat:@"thread %u's failing compare: failed %u, expected came back %u (not %u), slot %u; ", g,
+			    o[g * 3], o[g * 3 + 1], g * 3, ps[g]];
+		}
+		if ((o[g * 3 + 2] != 1 || ps[N + g] != g + 1000) && bad++ == 0) {
+			[first appendFormat:@"thread %u's succeeding compare: ok %u, slot %u (not %u); ", g, o[g * 3 + 2], ps[N + g],
+			    g + 1000];
+		}
+	}
+	[t note:@"64 threads: counter %u (want 64), %u wrong", c[0], bad];
+	if (bad) {
+		[t fail:@"%@%u wrong", first, bad];
+		return;
+	}
+	[t pass:@"compare-exchange: 64 retry-loop increments of one counter, and per thread a failing compare (expected "
+	    "read back) and a succeeding one"];
+}
+
+/*
  * A kernel READING a cube texture (texturecube<float, access::read>::read(uint2, face)) -- what SceneKit's
  * texturecube_copy_kernel and RealityKit's probe-mip kernels do -- from a cube the processor filled face by face
  * (-replaceRegion:...slice:), made for shader reads only. The K40 port's translator refused the read until 11-18: a
@@ -9217,6 +9313,7 @@ static const struct {
 	{ "metal.bitcast.repack", test_metal_repack },
 	{ "metal.cube.write", test_metal_cube_write },
 	{ "metal.cube.read", test_metal_cube_read },
+	{ "metal.atomic.cmpxchg", test_metal_atomic_cmpxchg },
 	{ "metal.point.coord", test_metal_point_coord },
 	{ "metal.const.array", test_metal_const_array },
 	{ "metal.occlusion", test_metal_occlusion },
