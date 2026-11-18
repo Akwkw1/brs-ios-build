@@ -8822,6 +8822,104 @@ test_metal_cube_write(MetalTest *t)
 }
 
 /*
+ * A kernel READING a cube texture (texturecube<float, access::read>::read(uint2, face)) -- what SceneKit's
+ * texturecube_copy_kernel and RealityKit's probe-mip kernels do -- from a cube the processor filled face by face
+ * (-replaceRegion:...slice:), made for shader reads only. The K40 port's translator refused the read until 11-18: a
+ * texel fetch from a cube sampler is nothing its GPU compiler has, so the cube is bound as a read-only image.
+ */
+static NSString *const kCubeReadSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_cube_read(texturecube<float, access::read> cube [[texture(0)]], device float4 *out [[buffer(0)]],\n"
+"    uint3 gid [[thread_position_in_grid]]) {\n"
+"    out[(gid.z * 8u + gid.y) * 8u + gid.x] = cube.read(gid.xy, gid.z);\n"
+"}\n";
+
+static void
+test_metal_cube_read(MetalTest *t)
+{
+	enum { S = 8 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kCubeReadSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_cube_read"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	MTLTextureDescriptor *d = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                                                 size:S mipmapped:NO];
+	d.usage = MTLTextureUsageShaderRead;
+	d.storageMode = MTLStorageModeShared;
+	id<MTLTexture> cube = [g_device newTextureWithDescriptor:d];
+	if (cube == nil) {
+		[t fail:@"no %ux%u cube texture", S, S];
+		return;
+	}
+	for (unsigned face = 0; face < 6; face++) {
+		uint8_t px[S * S * 4];
+		for (unsigned y = 0; y < S; y++) {
+			for (unsigned x = 0; x < S; x++) {
+				uint8_t *p = px + (y * S + x) * 4;
+				p[0] = (uint8_t)(x * 30);
+				p[1] = (uint8_t)(y * 30);
+				p[2] = (uint8_t)(face * 40);
+				p[3] = 255;
+			}
+		}
+		[cube replaceRegion:MTLRegionMake2D(0, 0, S, S) mipmapLevel:0 slice:face withBytes:px bytesPerRow:S * 4
+		      bytesPerImage:S * S * 4];
+	}
+	id<MTLBuffer> out = [g_device newBufferWithLength:6 * S * S * 16 options:MTLResourceStorageModeShared];
+	memset(out.contents, 0xff, out.length);
+	id<MTLCommandBuffer> b = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setTexture:cube atIndex:0];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e dispatchThreadgroups:MTLSizeMake(1, 1, 6) threadsPerThreadgroup:MTLSizeMake(S, S, 1)];
+	[e endEncoding];
+	if (!finish(b, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const float *o = out.contents;
+	unsigned bad = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned face = 0; face < 6; face++) {
+		for (unsigned y = 0; y < S; y++) {
+			for (unsigned x = 0; x < S; x++) {
+				const float *v = o + ((face * S + y) * S + x) * 4;
+				float want[4] = { x * 30 / 255.0f, y * 30 / 255.0f, face * 40 / 255.0f, 1.0f };
+				bool ok = true;
+				for (unsigned c = 0; c < 4; c++) {
+					ok = ok && fabsf(v[c] - want[c]) < 0.5f / 255.0f;
+				}
+				if (!ok && bad++ == 0) {
+					[first appendFormat:@"face %u (%u,%u): %.3f %.3f %.3f %.3f, not %.3f %.3f %.3f 1; ", face, x, y,
+					    v[0], v[1], v[2], v[3], want[0], want[1], want[2]];
+				}
+			}
+		}
+	}
+	[t note:@"6 faces of 8x8 read by a kernel: %u texels wrong", bad];
+	if (bad) {
+		[t fail:@"%@%u wrong texels", first, bad];
+		return;
+	}
+	[t pass:@"a kernel read all six faces of an 8x8 cube texture made for shader reads only (texturecube::read with a "
+	    "face), every texel right"];
+}
+
+/*
  * A point sprite: one point of [[point_size]] 32 at the centre of a 64x64 target, its fragment shader returning
  * [[point_coord]] as red and green -- what SpriteKit's particles and point-sprite shaders read. The coordinate runs
  * from 0 at the point's top left to 1 at its bottom right. And clz in a kernel (count_leading_zeros), which SceneKit's
@@ -9118,6 +9216,7 @@ static const struct {
 	{ "metal.pointer.loop", test_metal_pointer_loop },
 	{ "metal.bitcast.repack", test_metal_repack },
 	{ "metal.cube.write", test_metal_cube_write },
+	{ "metal.cube.read", test_metal_cube_read },
 	{ "metal.point.coord", test_metal_point_coord },
 	{ "metal.const.array", test_metal_const_array },
 	{ "metal.occlusion", test_metal_occlusion },
