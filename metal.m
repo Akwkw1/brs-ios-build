@@ -8822,6 +8822,91 @@ test_metal_cube_write(MetalTest *t)
 }
 
 /*
+ * Two threadgroup buffers sized at dispatch (-setThreadgroupMemoryLength:atIndex: 0 and 1) beside a static threadgroup
+ * array of the kernel's own: every thread writes its slot in all three, a barrier, then each reads its neighbour's --
+ * so any two of them laid over each other show. MPSMatrix, RealityKit, VFX's sort and iWork's particles declare more
+ * than one; the K40 port took one buffer, at offset 0, and nothing else beside it, until 11-18.
+ */
+static NSString *const kTgMultiSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_tg_multi(threadgroup uint *a [[threadgroup(0)]], threadgroup uint *b [[threadgroup(1)]],\n"
+"    device uint *out [[buffer(0)]], uint lid [[thread_position_in_threadgroup]],\n"
+"    uint tg [[threadgroup_position_in_grid]]) {\n"
+"    threadgroup uint s[64];\n"
+"    a[lid] = lid + 1000u + tg;\n"
+"    b[lid] = lid + 2000u + tg;\n"
+"    b[64u + lid] = lid + 4000u + tg;\n"
+"    s[lid] = lid + 3000u + tg;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    uint n = (lid + 1u) % 64u, o = (tg * 64u + lid) * 4u;\n"
+"    out[o + 0u] = a[n];\n"
+"    out[o + 1u] = b[n];\n"
+"    out[o + 2u] = s[n];\n"
+"    out[o + 3u] = b[64u + n];\n"
+"}\n";
+
+static void
+test_metal_threadgroup_multi(MetalTest *t)
+{
+	enum { N = 64, G = 2 };
+	NSError *error = nil;
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	id<MTLLibrary> lib = [g_device newLibraryWithSource:kTgMultiSource options:nil error:&error];
+	id<MTLComputePipelineState> k = lib == nil ? nil :
+	    [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_tg_multi"] error:&error];
+	if (k == nil) {
+		[t fail:@"the kernel was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	id<MTLBuffer> out = [g_device newBufferWithLength:G * N * 4 * 4 options:MTLResourceStorageModeShared];
+	memset(out.contents, 0xff, out.length);
+	id<MTLCommandBuffer> cb = [[g_device newCommandQueue] commandBuffer];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+
+	[e setComputePipelineState:k];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e setThreadgroupMemoryLength:N * 4 atIndex:0];
+	[e setThreadgroupMemoryLength:2 * N * 4 atIndex:1];
+	[e dispatchThreadgroups:MTLSizeMake(G, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e endEncoding];
+	if (!finish(cb, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	const uint32_t *o = out.contents;
+	unsigned bad = 0;
+	NSMutableString *first = [NSMutableString string];
+
+	for (unsigned g = 0; g < G; g++) {
+		for (unsigned l = 0; l < N; l++) {
+			unsigned n = (l + 1) % N;
+			const uint32_t *v = o + (g * N + l) * 4;
+			uint32_t want[4] = { n + 1000 + g, n + 2000 + g, n + 3000 + g, n + 4000 + g };
+			for (unsigned i = 0; i < 4; i++) {
+				if (v[i] != want[i] && bad++ == 0) {
+					[first appendFormat:@"group %u thread %u, %s: %u, not %u; ", g, l,
+					    i == 0 ? "buffer 0" : i == 1 ? "buffer 1" : i == 2 ? "the static array" : "buffer 1's 2nd half",
+					    v[i], want[i]];
+				}
+			}
+		}
+	}
+	[t note:@"2 groups x 64 threads x 4 reads: %u wrong", bad];
+	if (bad) {
+		[t fail:@"%@%u wrong", first, bad];
+		return;
+	}
+	[t pass:@"two threadgroup buffers sized at dispatch (256 and 512 bytes) and a static threadgroup array, side by "
+	    "side, each thread's neighbour read back right in both groups"];
+}
+
+/*
  * Compare-exchange on device memory (atomic_compare_exchange_weak_explicit): 64 threads adding 1 to one counter by a
  * retry loop -- the shape every lock-free GPU structure has -- and per thread a compare that must fail (its `expected`
  * then holds the value it found) and one that must succeed. MLCompute's gradient and scatter kernels use it. The K40
@@ -9314,6 +9399,7 @@ static const struct {
 	{ "metal.cube.write", test_metal_cube_write },
 	{ "metal.cube.read", test_metal_cube_read },
 	{ "metal.atomic.cmpxchg", test_metal_atomic_cmpxchg },
+	{ "metal.threadgroup.multi", test_metal_threadgroup_multi },
 	{ "metal.point.coord", test_metal_point_coord },
 	{ "metal.const.array", test_metal_const_array },
 	{ "metal.occlusion", test_metal_occlusion },
