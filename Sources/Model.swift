@@ -116,7 +116,7 @@ final class AppModel: ObservableObject {
             let ip = String(cString: host)
             if ip.hasPrefix("127.") { continue }
             if name == "en0" { return ip }
-            if name.hasPrefix("en") { fallback = ip }
+            if name.hasPrefix("en") || name.hasPrefix("bridge") { fallback = ip }
         }
         return fallback
     }
