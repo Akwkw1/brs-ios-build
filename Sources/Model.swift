@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import CryptoKit
+import Darwin
 
 // MARK: - 数据模型（对应 studio.json）
 
@@ -70,6 +71,7 @@ final class AppModel: ObservableObject {
     @Published var targetDir = "/update"
     @Published var uploadProgress: Double?
     @Published var uploadEntryID: String?
+    @Published var wifiIP: String?
 
     private var downloaders: [String: Downloader] = [:]
     private var uploader: Uploader?
@@ -92,12 +94,47 @@ final class AppModel: ObservableObject {
         FileManager.default.temporaryDirectory
     }
 
+    // MARK: 本机网络（iPhone 的 Wi-Fi 地址，不需要任何权限）
+
+    nonisolated static func wifiIPv4() -> String? {
+        var addrs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addrs) == 0, let first = addrs else { return nil }
+        defer { freeifaddrs(addrs) }
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        var fallback: String?
+        while let p = ptr {
+            let ifa = p.pointee
+            ptr = ifa.ifa_next
+            guard let addr = ifa.ifa_addr else { continue }
+            if addr.pointee.sa_family != UInt8(AF_INET) { continue }
+            let name = String(cString: ifa.ifa_name)
+            var host = [CChar](repeating: 0, count: 64)
+            let len = socklen_t(addr.pointee.sa_len)
+            guard getnameinfo(addr, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: host)
+            if ip.hasPrefix("127.") { continue }
+            if name == "en0" { return ip }
+            if name.hasPrefix("en") { fallback = ip }
+        }
+        return fallback
+    }
+
+    func refreshNet() {
+        wifiIP = Self.wifiIPv4()
+        if let ip = wifiIP {
+            log("本机 Wi-Fi 地址 \(ip)")
+        } else {
+            log("没有 Wi-Fi 地址")
+        }
+    }
+
     init() {
         for d in [Self.fwDir, Self.packDir] {
             try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
         }
         scanLocal()
         loadCache()
+        wifiIP = Self.wifiIPv4()
     }
 
     // MARK: 日志
@@ -325,7 +362,7 @@ final class AppModel: ObservableObject {
             log("设备在线：\(trimmed) \(title) 目录 \(deviceDirs.count) 个")
         } catch {
             deviceOnline = false
-            alert = "连不上 \(trimmed)\n先把手机 Wi-Fi 连到设备热点（BlackRadar-XXXX），再点探测。\n\(error.localizedDescription)"
+            alert = "连不上 \(trimmed)\n\n1. 手机 Wi-Fi 是否连在设备热点（BlackRadar-XXXX）？本机地址：\(wifiIP ?? "无 Wi-Fi")\n2. 设备上是否已打开 Wi-Fi / 网页传输页面？Web 服务只在那一页跑。\n3. 关掉 VPN、代理、iCloud 私密代理再试。\n\n\(error.localizedDescription)"
             log("探测失败：\(error.localizedDescription)")
         }
     }

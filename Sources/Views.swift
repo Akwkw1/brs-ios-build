@@ -295,6 +295,25 @@ struct LocalCard: View {
 struct DeviceView: View {
     @EnvironmentObject var m: AppModel
 
+    private var subnetHint: String {
+        guard let ip = m.wifiIP else {
+            return "手机现在没有 Wi-Fi 地址：先在「设置 → 无线局域网」连上设备热点。"
+        }
+        if ip.hasPrefix("169.254.") {
+            return "拿到的是 169.254.x.x，热点没发地址（DHCP 失败）。在设置里「忘记此网络」再连一次。"
+        }
+        if ip.hasPrefix("192.168.4.") {
+            return "在 192.168.4.x 网段，和设备同网段，网关就是 192.168.4.1。"
+        }
+        return "当前是 \(ip)，不在 192.168.4.x：手机连的还是别的 Wi-Fi（家里/公司路由），设备热点没连上。"
+    }
+
+    private var subnetHintColor: Color {
+        guard let ip = m.wifiIP else { return Theme.warn }
+        if ip.hasPrefix("192.168.4.") { return Theme.ok }
+        return Theme.warn
+    }
+
     private var localEntries: [FirmwareEntry] {
         m.entries.filter { m.localFile(for: $0.id) != nil }
     }
@@ -303,6 +322,30 @@ struct DeviceView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    SectionTitle(text: "0 · 本机网络")
+                    Card {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Wi-Fi 地址")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(Theme.sub)
+                                Spacer()
+                                Text(m.wifiIP ?? "没有")
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .foregroundStyle(m.wifiIP == nil ? Theme.warn : Theme.text)
+                                Button {
+                                    m.refreshNet()
+                                } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                .tint(Theme.gold)
+                            }
+                            Text(subnetHint)
+                                .font(.system(size: 12))
+                                .foregroundStyle(subnetHintColor)
+                        }
+                    }
+
                     SectionTitle(text: "1 · 连到设备热点")
                     Card {
                         VStack(alignment: .leading, spacing: 8) {
@@ -432,6 +475,21 @@ struct DeviceView: View {
                         }
                     }
 
+                    SectionTitle(text: "打不开 192.168.4.1 时按顺序查")
+                    Card {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("1. Wi-Fi 是否连的是 BlackRadar-XXXX，上面「Wi-Fi 地址」要是 192.168.4.x")
+                            Text("2. 设备上要停在 Wi-Fi / 网页传输那一屏，Web 服务只在那屏跑")
+                            Text("3. 关掉 VPN、加速器、代理软件（Clash/Shadowrocket 等）")
+                            Text("4. 关掉 iCloud 私密代理：设置 → 你的名字 → iCloud → 私密代理")
+                            Text("5. 关掉「无线局域网助理」，避免蜂窝和 Wi-Fi 来回切")
+                            Text("6. 在 设置 → 无线局域网 →（i）里看「路由器」那一行，那才是真实网关")
+                            Text("7. 用 http:// 不要用 https://，也不要加端口以外的路径")
+                        }
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.sub)
+                    }
+
                     if let up = m.uploadProgress, let id = m.uploadEntryID, m.localFile(for: id) != nil {
                         Button(role: .destructive) {
                             m.cancelUpload()
@@ -447,6 +505,7 @@ struct DeviceView: View {
             .background(Theme.bg)
             .navigationTitle("设备")
             .scrollDismissesKeyboard(.interactively)
+            .task { m.refreshNet() }
         }
     }
 }
