@@ -497,6 +497,37 @@ struct DeviceView: View {
                         }
                     }
 
+                    SectionTitle(text: "开不了热点也能刷：SD 卡")
+                    Card {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("这条路完全不碰 Wi-Fi：把固件拷到 SD 卡，让设备自己刷。")
+                                .font(.system(size: 12))
+                                .foregroundStyle(Theme.text.opacity(0.9))
+                            Text("1. SD 卡用 FAT32，根目录建 update 文件夹")
+                            Text("2. 把固件另存为 update/firmware.bin")
+                            Text("3. 插卡，设备进 SD 刷机界面，按 ENTER")
+                            Text("4. 写完自动重启")
+                                .padding(.bottom, 2)
+                            Text("下面的按钮把选中的固件交给系统「存储到文件」，选到读卡器里的 SD 卡即可。")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.sub)
+                            if let first = localEntries.first, let f = m.localFile(for: first.id) {
+                                ShareLink(item: f.url) {
+                                    Label("导出 \(first.id).bin 到「文件」", systemImage: "square.and.arrow.up")
+                                        .font(.system(size: 12, weight: .semibold))
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(Theme.gold)
+                            } else {
+                                Text("先在「固件」页下载一份固件")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Theme.warn)
+                            }
+                        }
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.text.opacity(0.9))
+                    }
+
                     SectionTitle(text: "打不开 192.168.4.1 时按顺序查")
                     Card {
                         VStack(alignment: .leading, spacing: 6) {
