@@ -308,7 +308,7 @@ struct DeviceView: View {
         if ip.hasPrefix("172.20.10.") {
             return "在 iPhone 个人热点网段：设备连上热点后一般是 172.20.10.2–6，点「自动扫描」。"
         }
-        return "当前是 \(ip)，不在 192.168.4.x：手机连的还是别的 Wi-Fi（家里/公司路由），设备热点没连上。"
+        return "当前是 \(ip)：连着普通 Wi-Fi。想让设备也连这个 Wi-Fi 就点「扫描 → 同一个 Wi-Fi 的本网段」；想用设备热点就手动切过去。"
     }
 
     private var subnetHintColor: Color {
@@ -403,22 +403,35 @@ struct DeviceView: View {
                                     .font(.system(size: 12))
                                     .foregroundStyle(m.deviceOnline ? Theme.ok : Theme.sub)
                                 Spacer()
-                                Button {
-                                    Task { await m.scanDevices() }
+                                Menu {
+                                    Button {
+                                        Task { await m.scanDevices() }
+                                    } label: {
+                                        Label("设备热点 / iPhone 个人热点", systemImage: "wifi")
+                                    }
+                                    Button {
+                                        Task { await m.scanLAN() }
+                                    } label: {
+                                        Label("同一个 Wi-Fi 的本网段", systemImage: "network")
+                                    }
                                 } label: {
-                                    Text(m.scanning ? "扫描中…" : "自动扫描")
+                                    Text((m.scanning || m.lanScanning) ? "扫描中…" : "扫描")
                                         .font(.system(size: 12, weight: .medium))
                                         .padding(.horizontal, 10)
                                         .padding(.vertical, 5)
                                         .background(Theme.gold.opacity(0.16))
                                         .clipShape(Capsule())
                                 }
-                                .buttonStyle(.plain)
                                 .foregroundStyle(Theme.gold)
-                                .disabled(m.scanning || m.deviceProbing)
+                                .disabled(m.scanning || m.lanScanning || m.deviceProbing)
                             }
                             if !m.scanFound.isEmpty {
-                                Text("扫到：" + m.scanFound.joined(separator: " / "))
+                                Text("热点网段扫到：" + m.scanFound.joined(separator: " / "))
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(Theme.ok)
+                            }
+                            if !m.lanFound.isEmpty {
+                                Text("本网段扫到：" + m.lanFound.joined(separator: " / "))
                                     .font(.system(size: 11, design: .monospaced))
                                     .foregroundStyle(Theme.ok)
                             }

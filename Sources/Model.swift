@@ -74,6 +74,8 @@ final class AppModel: ObservableObject {
     @Published var wifiIP: String?
     @Published var scanning = false
     @Published var scanFound: [String] = []
+    @Published var lanScanning = false
+    @Published var lanFound: [String] = []
 
     private var downloaders: [String: Downloader] = [:]
     private var uploader: Uploader?
@@ -163,6 +165,63 @@ final class AppModel: ObservableObject {
         } else {
             log("扫描没找到设备（试过 \(Self.candidates.count) 个地址）")
             alert = "没扫到设备。\n\n确认：\n1. 手机连了设备热点（BlackRadar-XXXX），或设备已连上你的热点\n2. 设备停在 Wi-Fi/网页那一屏（退出就关无线）\n3. 关掉 VPN、代理、私密代理"
+        }
+    }
+
+    nonisolated static func pageTitle(_ host: String) async -> String? {
+        guard let url = URL(string: "http://\(host)/") else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.0
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            let html = String(data: data, encoding: .utf8) ?? ""
+            return Self.firstMatch(html, pattern: "<title>(.*?)</title>") ?? ""
+        } catch {
+            return nil
+        }
+    }
+
+    /// 手机和设备连同一个 Wi-Fi 时，扫本机 /24 网段找设备
+    func scanLAN() async {
+        guard let ip = Self.wifiIPv4() ?? wifiIP else {
+            alert = "手机没有 Wi-Fi 地址，先连上和设备同一个 Wi-Fi"
+            return
+        }
+        wifiIP = ip
+        let parts = ip.split(separator: ".")
+        guard parts.count == 4 else { return }
+        let prefix = "\(parts[0]).\(parts[1]).\(parts[2])."
+        lanScanning = true
+        lanFound = []
+        defer { lanScanning = false }
+
+        var hosts: [String] = []
+        for i in 1...254 { hosts.append(prefix + "\(i)") }
+        var hits: [String] = []
+        await withTaskGroup(of: (String, String?)?.self) { group in
+            for h in hosts {
+                group.addTask {
+                    let title = await Self.pageTitle(h)
+                    return title == nil ? nil : (h, title)
+                }
+            }
+            for await r in group {
+                guard let r = r else { continue }
+                if let t = r.1, t.lowercased().contains("blackradar") {
+                    hits.append(r.0)
+                }
+            }
+        }
+        lanFound = hits.sorted()
+        if let first = lanFound.first {
+            host = first
+            log("同网段找到设备 \(first)")
+            await probeDevice()
+        } else {
+            log("本网段扫描无结果 \(prefix)0/24")
+            alert = "没在 \(prefix)0/24 扫到 BlackRadar 设备。\n\n可能：\n1. 设备没连上这个 Wi-Fi（2.4G、WPA2）\n2. 路由器开了 AP 隔离\n3. 设备在别的网段（如访客网络）"
         }
     }
 
