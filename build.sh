@@ -1,59 +1,102 @@
 #!/bin/bash
-# SystemCheck.ipa, not signed by Apple: for an iOS that installs apps without Apple's signature (the K40 port), or for
-# whatever re-signs it to put it on an iPhone.
-#   macOS:      ./build.sh                      (Xcode's clang and iPhoneOS SDK, through xcrun)
-#   elsewhere:  CC=<a clang that targets iOS and links with ld64> SDK=<an iPhoneOS SDK> ./build.sh
-#               e.g. CC=xnu-clang SDK=$THEOS/sdks/iPhoneOS16.5.sdk
-# OUT=DIR (default build/): DIR/Payload/SystemCheck.app and DIR/SystemCheck.ipa.
-# With ldid on PATH (or LDID=another one) the program is signed with Entitlements.plist, the entitlement the light
-# sensor's HID events need; without it, it keeps whatever signature the linker gave it, and the Sensors tab sees no
-# light sensor.
+# 黑雷达 Studio · iOS —— 未签名 IPA 构建脚本
+#
+#   macOS（Xcode 15+）： ./build.sh
+#   产物：build/BlackRadarStudio-0.1.0-unsigned.ipa（另存一份 build/SystemCheck.ipa 给 CI 用）
+#   模拟器冒烟测试（默认开）：SIM=0 ./build.sh 可关掉
 set -euo pipefail
+
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-$HERE/build}
+NAME=BlackRadarStudio
+VERSION=0.1.0
+BUNDLE_ID=com.akwkw1.blackradarstudio
+
 if [ -z "${SDK:-}" ] && command -v xcrun >/dev/null 2>&1; then
 	SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-	CC=${CC:-$(xcrun --sdk iphoneos --find clang)}
+	SWIFTC=${SWIFTC:-$(xcrun --sdk iphoneos --find swiftc)}
 fi
-: "${SDK:?SDK: an iPhoneOS SDK (on macOS xcrun finds it)}"
-CC=${CC:-clang}
-LDID=${LDID:-ldid}
-APP=$OUT/Payload/SystemCheck.app
+: "${SDK:?需要一个 iPhoneOS SDK（macOS 上 xcrun 会自己找）}"
+SWIFTC=${SWIFTC:-swiftc}
 
-rm -rf "$OUT/Payload" "$OUT/SystemCheck.ipa"
+rm -rf "$OUT/Payload" "$OUT/sim" "$OUT/$NAME-$VERSION-unsigned.ipa" "$OUT/SystemCheck.ipa"
+mkdir -p "$OUT/Payload"
+APP="$OUT/Payload/$NAME.app"
 mkdir -p "$APP"
-# (-target, not -arch and -miphoneos-version-min: a wrapper such as xnu-clang puts its own -target ios16.5 first, which
-# wins over -miphoneos-version-min, and the program would then ask for iOS 16.5; the last -target is the one that counts)
-# (OpenGLES linked by the program itself, not only through GLKit: the K40 port gives an application the GPU's OpenGL ES
-# only when its main binary loads OpenGLES.framework. Metal, SpriteKit and SceneKit weakly: where one is missing, the
-# application still starts and that test says so. IOKit: the SDK has its library, not its headers; the GPU's kernel
-# service and the light sensor are reached through it.)
-$CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O1 -fobjc-arc \
-	-framework UIKit -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework QuartzCore \
-	-framework OpenGLES -framework GLKit -framework CoreImage -framework AVFoundation -framework CoreMedia \
-	-framework AudioToolbox -framework CoreMotion -framework CoreLocation -framework CoreBluetooth -framework CoreVideo \
-	-framework CoreHaptics -framework IOKit \
-	-weak_framework Metal -weak_framework MetalKit -weak_framework SpriteKit -weak_framework SceneKit \
-	-weak_framework MetalPerformanceShaders -weak_framework Photos \
-	-o "$APP/SystemCheck" "$HERE/main.m" "$HERE/gpu.m" "$HERE/metal.m" "$HERE/video.m" "$HERE/sensors.m" \
-	"$HERE/motion.m" "$HERE/gps.m" "$HERE/effects.m"
-if command -v "$LDID" >/dev/null 2>&1; then
-	sed 's/\r$//' "$HERE/Entitlements.plist" > "$OUT/Entitlements.plist"
-	"$LDID" -S"$OUT/Entitlements.plist" "$APP/SystemCheck"
-	echo "build.sh: signed by $LDID with Entitlements.plist"
-fi
-sed 's/\r$//' "$HERE/Info.plist" > "$APP/Info.plist"
-cp "$HERE/test.mp4" "$APP/"
-# the Metal tab's own shaders, built from source by github.com/xiongnemo/ios-alioth-devtools (metal/alioth-tests.metal,
-# Xcode's compiler, for iOS 16): its release's alioth-tests.metallib, fetched once into build/ (METALLIB=FILE: that one)
-METALLIB=${METALLIB:-$OUT/alioth-tests-v3.metallib}
-if [ ! -f "$METALLIB" ]; then
-	# (retried for two minutes: GitHub's release downloads answered 504 for a while on 2026-11-09)
-	curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o "$METALLIB" \
-		https://github.com/xiongnemo/ios-alioth-devtools/releases/download/v3/alioth-tests.metallib
-fi
-cp "$METALLIB" "$APP/alioth-tests.metallib"
+
+echo "== 编译设备版: $("$SWIFTC" --version 2>/dev/null | head -1)"
+"$SWIFTC" -sdk "$SDK" -target arm64-apple-ios17.0 \
+	-swift-version 5 -O -parse-as-library -module-name "$NAME" \
+	-o "$APP/$NAME" "$HERE"/Sources/*.swift
+
+cp "$HERE/Info.plist" "$APP/Info.plist"
 python3 -I "$HERE/mkicon.py" "$APP"
 printf 'APPL????' > "$APP/PkgInfo"
-(cd "$OUT" && python3 -c "import shutil; shutil.make_archive('SystemCheck', 'zip', '.', 'Payload')" && mv SystemCheck.zip SystemCheck.ipa)
-ls -l "$OUT/SystemCheck.ipa"
+
+if command -v ldid >/dev/null 2>&1; then
+	ldid -S "$APP/$NAME" && echo "== ldid 已做临时签名（Sideloadly/eSign 会重签）"
+fi
+
+echo "== 打包 IPA"
+(cd "$OUT" && python3 -c "import shutil; shutil.make_archive('$NAME-$VERSION-unsigned','zip','.','Payload')")
+mv "$OUT/$NAME-$VERSION-unsigned.zip" "$OUT/$NAME-$VERSION-unsigned.ipa"
+cp "$OUT/$NAME-$VERSION-unsigned.ipa" "$OUT/SystemCheck.ipa"
+ls -l "$OUT/$NAME-$VERSION-unsigned.ipa"
+
+# ---------- 模拟器冒烟测试：装一遍、跑起来、截张图 ----------
+if [ "${SIM:-1}" = "1" ] && command -v xcrun >/dev/null 2>&1 && command -v swiftc >/dev/null 2>&1; then
+	SIMSDK=$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null || true)
+	if [ -n "$SIMSDK" ]; then
+		SIMAPP="$OUT/sim/$NAME.app"
+		mkdir -p "$SIMAPP"
+		echo "== 编译模拟器版"
+		if "$SWIFTC" -sdk "$SIMSDK" -target arm64-apple-ios17.0-simulator \
+			-swift-version 5 -Onone -parse-as-library -module-name "$NAME" \
+			-o "$SIMAPP/$NAME" "$HERE"/Sources/*.swift; then
+			cp "$HERE/Info.plist" "$SIMAPP/Info.plist"
+			python3 -I "$HERE/mkicon.py" "$SIMAPP" >/dev/null
+			UDID=$(python3 - <<'PY'
+import json, subprocess
+out = subprocess.run(["xcrun", "simctl", "list", "devices", "available", "-j"],
+                     capture_output=True, text=True).stdout
+try:
+    data = json.loads(out)
+except Exception:
+    print("")
+    raise SystemExit
+best = ""
+for runtime, devs in data.get("devices", {}).items():
+    if "iOS" not in runtime:
+        continue
+    for d in devs:
+        if d.get("isAvailable") and str(d.get("name", "")).startswith("iPhone"):
+            best = d.get("udid", "")
+print(best)
+PY
+)
+			if [ -n "$UDID" ]; then
+				echo "== 模拟器 $UDID"
+				xcrun simctl boot "$UDID" 2>/dev/null || true
+				xcrun simctl bootstatus "$UDID" -b 2>/dev/null || true
+				xcrun simctl install "$UDID" "$SIMAPP" || true
+				xcrun simctl launch "$UDID" "$BUNDLE_ID" || true
+				sleep 9
+				xcrun simctl io "$UDID" screenshot "$OUT/screenshot.png" || true
+				if [ -f "$OUT/screenshot.png" ]; then
+					echo "== 截图 $OUT/screenshot.png ($(wc -c < "$OUT/screenshot.png") bytes)"
+					echo "SCREENSHOT_BASE64_BEGIN"
+					python3 -c "import base64,sys;print(base64.b64encode(open(sys.argv[1],'rb').read()).decode())" "$OUT/screenshot.png"
+					echo "SCREENSHOT_BASE64_END"
+				fi
+				echo "== 最近崩溃报告（如果有）"
+				ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -3 || echo "无"
+			else
+				echo "== 没有可用的 iPhone 模拟器，跳过冒烟测试"
+			fi
+		else
+			echo "!! 模拟器编译失败，跳过冒烟测试"
+		fi
+	fi
+fi
+
+echo "完成：$OUT/$NAME-$VERSION-unsigned.ipa"

@@ -1,142 +1,148 @@
 #!/usr/bin/env python3
-"""The icon of SystemCheck as the PNGs its Info.plist names (no asset catalog: actool is a Mac program): four tiles
-on a graphite to steel-blue gradient, one per kind of check -- an orange one with a chip (the GPU), a slate one with a
-cube (Metal), a red one with a play sign (video), a green one with a signal (the sensors) -- tied together by a teal
-disc in a white ring with a white check mark where their corners meet. SpringBoard rounds the corners itself.
-usage: python3 -I mkicon.py APP_DIR"""
+"""纯标准库画图标：深色底 + 金色雷达。用法: mkicon.py <App 目录>"""
 import math
 import os
 import struct
 import sys
 import zlib
 
-TOP, BOTTOM = (0x16, 0x1a, 0x22), (0x2a, 0x3a, 0x52)
-WHITE = (0xff, 0xff, 0xff)
-TEAL = (0x1f, 0xb5, 0xc4)
-TILE, GAP, CORNER = 0.36, 0.06, 0.07             # the tiles: side, the gap between them, their corners' radius
-TILES = (  # each: its centre, its colour at the top and at the bottom, its sign
-    ((0.29, 0.29), (0xf5, 0x9a, 0x3c), (0xd9, 0x68, 0x1a), 'chip'),
-    ((0.71, 0.29), (0x8f, 0x9b, 0xad), (0x5d, 0x68, 0x78), 'cube'),
-    ((0.29, 0.71), (0xec, 0x55, 0x5a), (0xc2, 0x2f, 0x35), 'play'),
-    ((0.71, 0.71), (0x3a, 0xc9, 0x80), (0x1f, 0x9a, 0x5a), 'signal'),
-)
-BADGE = (0.5, 0.5, 0.112)                        # the check's disc: centre and radius
-RING = 0.022
-CHECK = ((-0.050, 0.004), (-0.014, 0.040), (0.054, -0.034))
-STROKE = 0.021
-SS = 4      # samples per pixel along each side
+GOLD = (1.00, 0.77, 0.00)
+GOLD_DIM = (0.62, 0.48, 0.08)
+GREEN = (0.30, 0.92, 0.52)
 
 
-def mix(c, d, a):
-    return tuple(x + (y - x) * a for x, y in zip(c, d))
+def mix(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t)
 
 
-def in_rounded(u, v, cx, cy, half, r):
-    dx, dy = max(abs(u - cx) - (half - r), 0.0), max(abs(v - cy) - (half - r), 0.0)
-    return abs(u - cx) <= half and abs(v - cy) <= half and dx * dx + dy * dy <= r * r
+def over(dst, src, alpha):
+    return mix(dst, src, max(0.0, min(1.0, alpha)))
 
 
-def in_polygon(u, v, corners):
-    """in a convex polygon whose corners go round one way"""
-    sign = 0
-    for (x1, y1), (x2, y2) in zip(corners, corners[1:] + corners[:1]):
-        cross = (x2 - x1) * (v - y1) - (y2 - y1) * (u - x1)
-        if cross != 0:
-            if sign == 0:
-                sign = 1 if cross > 0 else -1
-            elif (cross > 0) != (sign > 0):
-                return False
-    return True
+def cov(d_norm, scale, w_px):
+    """d_norm 为归一化距离，scale 为每单位的像素数，w_px 为线宽（像素）。"""
+    d = abs(d_norm) * scale
+    return max(0.0, min(1.0, w_px * 0.5 + 0.5 - d))
 
 
-def segment(u, v, p, q):
-    (px, py), (qx, qy) = p, q
-    dx, dy = qx - px, qy - py
-    t = max(0.0, min(1.0, ((u - px) * dx + (v - py) * dy) / (dx * dx + dy * dy)))
-    return math.hypot(u - px - t * dx, v - py - t * dy)
+def render(n):
+    ss = 2
+    N = n * ss
+    scale = N / 2.0
+    acc = [[[0.0, 0.0, 0.0] for _ in range(n)] for _ in range(n)]
 
+    for y in range(N):
+        fy = (y + 0.5) / N * 2.0 - 1.0
+        for x in range(N):
+            fx = (x + 0.5) / N * 2.0 - 1.0
+            r = math.hypot(fx, fy)
 
-def sign(kind, x, y, c, tile):
-    """the tile's sign, at (x, y) from the tile's centre: the colour there, or c"""
-    if kind == 'chip':
-        # a white body with a die of the tile's colour, three pins a side
-        if in_rounded(x, y, 0, 0, 0.072, 0.014):
-            return tile if in_rounded(x, y, 0, 0, 0.034, 0.006) else WHITE
-        for k in (-0.040, 0.0, 0.040):
-            for px, py in ((k, 0.091), (k, -0.091), (0.091, k), (-0.091, k)):
-                if abs(x - px) <= (0.009 if abs(py) > abs(px) else 0.019) and \
-                        abs(y - py) <= (0.019 if abs(py) > abs(px) else 0.009):
-                    return WHITE
-        return c
-    if kind == 'cube':
-        t, r, m, l = (0, -0.088), (0.077, -0.044), (0, 0), (-0.077, -0.044)
-        br, b, bl = (0.077, 0.044), (0, 0.088), (-0.077, 0.044)
-        for corners, shade in (((t, r, m, l), WHITE), ((l, m, b, bl), (0xd5, 0xdb, 0xe3)),
-                               ((m, r, br, b), (0xa3, 0xad, 0xbb))):
-            if in_polygon(x, y, corners):
-                return shade
-        return c
-    if kind == 'play':
-        return WHITE if in_polygon(x, y, ((-0.040, -0.062), (0.066, 0.0), (-0.040, 0.062))) else c
-    # signal: a dot at the lower left, three quarter rings around it toward the upper right
-    dx, dy = x + 0.055, y - 0.055
-    d = math.hypot(dx, dy)
-    if d <= 0.022:
-        return WHITE
-    if dx >= -0.004 and dy <= 0.004:
-        for radius in (0.052, 0.090, 0.128):
-            if abs(d - radius) <= 0.0105:
-                return WHITE
-    return c
+            # 背景：中心略亮的径向渐变
+            col = mix((0.115, 0.115, 0.125), (0.030, 0.030, 0.035), min(1.0, r * 0.95))
 
+            # 圆角方形遮罩（圆角半径 0.30）
+            ax, ay = abs(fx), abs(fy)
+            lim = 0.955
+            corner = 0.30
+            inside = True
+            if ax > lim - corner and ay > lim - corner:
+                cx, cy = ax - (lim - corner), ay - (lim - corner)
+                inside = math.hypot(cx, cy) <= corner
+            elif ax > lim or ay > lim:
+                inside = False
 
-def color(u, v, bg):
-    c = bg
-    for (cx, cy), high, low, kind in TILES:
-        half = TILE / 2
-        if in_rounded(u + 0.012, v - 0.012, cx, cy, half, CORNER):
-            c = mix(c, (0, 0, 0), 0.30)           # a soft shadow below and to the left
-        if in_rounded(u, v, cx, cy, half, CORNER):
-            tile = mix(high, low, (v - (cy - half)) / TILE)
-            c = sign(kind, u - cx, v - cy, tile, tile)
-    bx, by, br = BADGE
-    r = math.hypot(u - bx, v - by)
-    if r < br + RING:
-        c = WHITE
-    if r < br:
-        c = TEAL
-        p = [(bx + x, by + y) for x, y in CHECK]
-        if min(segment(u, v, p[0], p[1]), segment(u, v, p[1], p[2])) < STROKE:
-            c = WHITE
-    return c
+            if not inside:
+                col = (0.0, 0.0, 0.0)
+            else:
+                # 外框
+                col = over(col, GOLD,
+                           cov(r - (lim - 0.018), scale, 2.4) * 0.85)
 
+                # 扫描扇形（从左上扫到右侧）
+                if r < 0.90 and r > 0.02:
+                    ang = math.degrees(math.atan2(-fy, fx)) % 360.0  # 逆时针、y 向上
+                    start, span = 96.0, 64.0
+                    d = (ang - start) % 360.0
+                    if d < span:
+                        fade = (1.0 - d / span) ** 1.6
+                        radial = 1.0 - (r / 0.90) ** 0.7
+                        beam = 0.55 * fade * radial
+                        # 前缘更亮
+                        edge = 1.0 - min(1.0, d / 5.0)
+                        beam += 0.30 * edge * radial
+                        col = over(col, GOLD, beam)
 
-def png(size):
+                # 同心圆
+                for ring in (0.30, 0.56, 0.82):
+                    c = cov(r - ring, scale, 2.0) * 0.55
+                    if c > 0:
+                        col = over(col, GOLD, c)
+                # 十字
+                if r < 0.90:
+                    c = max(cov(fx, scale, 1.6), cov(fy, scale, 1.6)) * 0.20
+                    col = over(col, GOLD_DIM, c)
+
+                # 光点
+                for (bx, by, s, bright) in (
+                    (0.34, 0.40, 0.055, 1.0),
+                    (-0.46, -0.30, 0.038, 0.75),
+                    (0.12, -0.62, 0.030, 0.55),
+                ):
+                    bd = math.hypot(fx - bx, fy - by)
+                    if bd < s:
+                        glow = (1.0 - bd / s)
+                        col = over(col, GREEN, (glow ** 1.5) * bright)
+
+            px, py = x // ss, y // ss
+            tgt = acc[py][px]
+            tgt[0] += col[0]
+            tgt[1] += col[1]
+            tgt[2] += col[2]
+
+    per = float(ss * ss)
     rows = []
-    for y in range(size):
-        row = bytearray([0])
-        bg = [a + (b - a) * y / (size - 1) for a, b in zip(TOP, BOTTOM)]
-        for x in range(size):
-            total = [0, 0, 0]
-            for i in range(SS):
-                for j in range(SS):
-                    c = color((x + (i + 0.5) / SS) / size, (y + (j + 0.5) / SS) / size, bg)
-                    total = [t + k for t, k in zip(total, c)]
-            row += bytes(min(255, round(t / (SS * SS))) for t in total)
-        rows.append(bytes(row))
+    for row in acc:
+        rows.append([(int(min(255, round(c[0] / per * 255))),
+                      int(min(255, round(c[1] / per * 255))),
+                      int(min(255, round(c[2] / per * 255)))) for c in row])
+    return rows
 
-    def chunk(kind, data):
-        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
-    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)) +
-            chunk(b'IDAT', zlib.compress(b''.join(rows), 9)) + chunk(b'IEND', b''))
+
+def write_png(path, rows, w, h):
+    raw = bytearray()
+    for row in rows:
+        raw.append(0)
+        for (r, g, b) in row:
+            raw += bytes((r, g, b))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
-    for scale in (2, 3):
-        with open(os.path.join(sys.argv[1], 'AppIcon60x60@%dx.png' % scale), 'wb') as f:
-            f.write(png(60 * scale))
+    app = sys.argv[1]
+    targets = {
+        "AppIcon60x60@2x.png": 120,
+        "AppIcon60x60@3x.png": 180,
+        "AppIcon76x76@2x~ipad.png": 152,
+        "AppIcon83.5x83.5@2x~ipad.png": 167,
+        "AppIcon1024.png": 1024,
+    }
+    for name, size in targets.items():
+        rows = render(size)
+        write_png(os.path.join(app, name), rows, size, size)
+        print("icon", name, size)
 
 
-main()
+if __name__ == "__main__":
+    main()

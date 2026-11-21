@@ -1,50 +1,144 @@
-# System Check
+# 黑雷达 Studio · iOS 版（BlackRadar Studio for iOS 17）
 
-把为 Redmi K40（alioth）上的 iOS 16.5 移植写的几个检测应用合成一个：一个 App，下面七个标签页。
-普通 iPhone 上它就是一个普通应用。
+把 `BlackRadarStudio-Android-0.1.0-test.apk` 重写成能在 iPhone / iPad（iOS 17+）上安装运行的原生 App。
+SwiftUI + URLSession，没有第三方依赖，编译产物是**未签名 IPA**，你自己用 Sideloadly / eSign / AltStore / 自签证书装。
 
-| 标签 | 原来的应用 | 做什么 |
-| --- | --- | --- |
-| GPU | GPU Check | 把 iOS 游戏可能用到的图形能力逐项测一遍（OpenGL ES 1/2/3、纹理和压缩格式、扩展、上屏、GLKit、CADisplayLink、Core Image、Metal、SceneKit、SpriteKit），每项 PASS / FAIL / SKIP，把应用带崩或卡住的记 CRASHED / HUNG |
-| Metal | Metal Check | 应用能找到的 Metal：系统、GPU 内核服务、Metal 的设备发现、移植的驱动用到的私有部分；Metal 没有自己的设备时，由应用注册移植的驱动，再测命令队列、清屏、三角形、compute（离屏读回，加上顶部两个方块里的上屏结果）；用 [ios-alioth-devtools](https://github.com/xiongnemo/ios-alioth-devtools) 编的测试着色器逐项测顶点、纹理、混合（含混合颜色）、视口、裁剪、剔除、裁剪距离、间接绘制、深度、4x MSAA、heap、compute 的各种写入、threadgroup 内存、function constant、blit；在手机上现编的着色器测 SIMD-group 和 quad 函数（归约、前缀和、广播、洗牌）、多个颜色附件各用各的清屏色、采样器限定 mip 范围以后的 compute、深度截断（depth clamp）、一个被拒的绘制后面的绘制照样画出来、DontCare 存储、2000 次带 `setVertexBytes` 的绘制、遮挡查询（visibility result）、线程数不能被线程组整除的 `dispatchThreads`（non-uniform threadgroup，边上的线程组更小，含跨 barrier 的 threadgroup 内存；以及每个线程组读到的整个网格的形状：`threadgroup_position_in_grid`、`threadgroups_per_grid`、`threads_per_grid`）；iOS 16.5 系统自带的 Metal 库里用到的几个函数（`atanh`、`asinh`、`acosh`、`sinpi`、`cospi`、`unpack_snorm4x8_to_float`、`hadd`、`rhadd`、`quad_shuffle_down`、`thread_index_in_quadgroup`）和处理器算的结果对比；循环里不断前移的指针（device 读、device 写、threadgroup 内存）、`as_type<>` 在不同宽度的向量之间（`uint`↔`uchar4`、`uint2`↔`ushort4`、`ushort`↔`uchar2`）、kernel 往 cube 纹理的六个面写、kernel 读一个只允许着色器读的 cube 纹理的六个面（`texturecube<float, access::read>::read`）、两个在派发时才定大小的 threadgroup 缓冲加上 kernel 自己的静态 threadgroup 数组（三块并排，互相不覆盖）、compare-exchange 原子操作（64 个线程用重试循环给同一个计数器加一，每个线程一次必定失败的比较——读回 `expected`——和一次必定成功的）、点精灵的 `[[point_coord]]`（左上角 0 到右下角 1，四个角分别读回）和 32 位、16 位的 `clz`、程序作用域的 `constant` 数组（float、uint、float3、混合 float/ushort/uchar/half 的结构体）按运行时的下标读，以及 16 位、8 位的 `ctz`/`popcount`；4x MSAA 的 resolve 一组：memoryless 附件、resolve 进 CAMetalLayer 的 drawable（读回，以及留在屏幕上的第三个方块）、屏幕大小的画面加 4x 深度模板、模板裁剪加 400 次绘制、深度裁剪加 400 次带索引和混合的绘制、先画一层再在同一个命令缓冲里采样它，每样分别 resolve 进普通纹理和 drawable；`metal.msaa.vsout` 测顶点着色器输出结构的几种写法（position 在最后、`invariant`、顶点数据在 buffer 30，Impeller 编出来的着色器就是这样）；MetalPerformanceShaders 里应用自己建的图像内核（直方图、高斯模糊、卷积、双线性和 Lanczos 缩放，Telegram 一类应用会用）；SpriteKit（SKRenderer）、SceneKit（SCNView 指定 Metal）、MTKView 连续画两秒。不测 MapKit：它的地图数据要苹果的服务器，地图用我们自己的 [Map](https://github.com/xiongnemo/ios-map) 测 |
-| Video | VideoCheck | 用 AVPlayer + AVPlayerLayer 循环播放内置的 6 秒测试视频（ffmpeg 的 testsrc2），报告播放器状态 |
-| Sensors | Sensor Check | 每个传感器和硬件输入实时显示：光线、距离、加速度计、陀螺仪、磁力计、气压、计步、指南针、定位、电池、麦克风、摄像头、蓝牙、方向、音量键、屏幕帧率、触摸、振动 |
-| Motion | Motion Test | 一部 3D 的手机跟着这台手机转（CoreMotion 的姿态），下面是加速度计、陀螺仪、设备运动的数值 |
-| GPS | （新） | 仿 GPS Status：卫星天空图（方位、仰角，按信号强度上色，参与定位的实心，随指南针转）、每颗卫星的信号柱、定位状态（在视/跟踪/使用的卫星数、精度、坐标、高度、速度、航向、定位时间）。数据两路并列：iOS 自己的（CoreLocation），以及移植内核从基带读到的卫星（sysctl `kern.hakios.gnss`，K40 的 SDX55 走 QMI LOC；iOS 不给应用卫星信息，所以卫星只来自这里，别的设备上没有这一路）。`/run` 画一张标着 DEMO 的假天空，用来检查绘制 |
-| Effects | （新） | Telegram 一类应用在 iOS 16 上的“毛玻璃”外观拆成单项，每项在移动的内容上跑 10 秒（先等 1 秒，再量 8 秒）：帧率、迟到的帧、最慢的一帧。单项有 UIVisualEffectView、CABackdropLayer 的高斯模糊（半径 2、6、20，以及四分之一分辨率）、colorMatrix 加模糊、边缘渐变的 variableBlur、4 个和 8 个玻璃胶囊、带不带玻璃的弹簧面板、120 张缩略图滚动、相册缩略图、摄像头实时画面，最后是应用自己用 Metal 画的玻璃着色器作对比。这些都是照公开的事实自己写的，没有 Telegram 的代码。`systemcheck://effects/photos` 往相册里加 60 张编号的渐变测试图（移植每次启动相册都是空的） |
+---
 
-- 顶部方块：蓝色的是 `metal.clear.layer`，下面橙色三角形是 `metal.triangle.layer`，左边白色三角形是 `metal.msaa.screen`
-  （4x MSAA resolve 进屏幕大小的 drawable）。黑的就是没画出来。
-- 打开时不会自己跑：GPU、Metal、Video、Effects 各有 Run 按钮。同一次启动里第一次按 Run 时，如果上次启动跑到一半崩了，
-  就从崩掉的那一项后面接着跑，之前崩过的项照样跳过；之后再按就是 Run again：从头跑，忘掉之前的标记。
-- Sensors、Motion、GPS 只在自己的标签页在前台时才开传感器和定位，切走就关（距离传感器开着会让屏幕在靠近时熄灭）。
-- 从电脑上驱动（移植的测试工具就是这么用的）：`systemcheck://<gpu|metal|video|sensors|motion|gps|effects>[/run]`，
-  切到那个标签页，带 `/run` 就开始测。
-- 记录：`Documents/gpucheck.log`、`Documents/metalcheck.log`、`Documents/gpscheck.log`、`Documents/effectscheck.log`
-  （开了文件共享），`/dev/console` 和 NSLog 里的 `gpucheck: …`、`metalcheck: …`、`videocheck: …`、`gpscheck: …`、
-  `effectscheck: …`。GPS 的记录只有卫星数和精度，不写坐标。
-- 进程里只有一个崩溃处理函数（`main.m`），GPU 和 Metal 两页各自登记自己“正在跑哪一项”的回调。
-- 测试自己的调用抛出的 Objective-C 异常算这一项 FAIL（带抛出位置：共享缓存的 slide 和返回地址），不再让应用闪退；
-  之后在别的 run loop 里抛的照样会带崩应用，下次启动标记、跳过。
-- Metal 页注册移植的 Metal 驱动以后（对整个进程有效，撤不回来），同一次启动里 GPU 页的 Metal 两项会过，
-  SpriteKit 的两项也改走 Metal（SpriteKit 看到有 Metal 设备就用它）。反过来，GPU 页先跑过 SKView / SCNView，
-  SpriteKit、SceneKit 在这个进程里就定在 OpenGL ES 上了，Metal 页的 `metal.spritekit`、`metal.scenekit` 记 SKIP。
-  要看普通应用在移植上拿到的结果，就关掉 App 重开、先跑 GPU 页。
+## 一、先说清楚：iOS 版为什么不用 USB 线刷
 
-- 包名：`com.anzupop.com.ios.systemcheck`
-- 最低 iOS 15.0，iPhone，竖屏
-- 只用 Objective-C 和系统框架；每个标签页一个 `.m` 文件，没有 storyboard、asset catalog
-- 链接 OpenGLES（移植只给主程序链接了 OpenGLES 的应用 GL），Metal、MetalKit、SpriteKit、SceneKit、MetalPerformanceShaders、Photos 弱链接
-- `build.sh` 从 devtools 的 v2 发布下载 `alioth-tests.metallib`（`METALLIB=文件` 用自己的）
-- 图标由 `mkicon.py` 生成（纯 Python）：四块分别代表 GPU、Metal、视频、传感器，中间一个对勾
-- `Entitlements.plist`：`com.apple.private.hid.client.event-monitor`（光线传感器的 HID 事件要它）
+把 APK 拆开看，它做的事很明确：
 
-## 编译
+| 位置 | 内容 |
+| --- | --- |
+| `cn.blackradar.studio.usb.RomWriter` | ESP32-S3 **ROM 下载协议**：SLIP 组帧、`SYNC` 同步、`FLASH_BEGIN / FLASH_DATA / FLASH_END`、128 KB 分块、寄存器读回校验、MD5 收尾 |
+| `cn.blackradar.studio.usb.AdvFlasher` | 走 `UsbDeviceConnection.bulkTransfer()` 直接把整个 merged image 写进 `0x0` |
+| `cn.blackradar.studio.catalog.FirmwareCatalog` | 从 `https://madsdai.com/blackradar/studio/studio.json` 拉目录、下载、SHA-256 校验、`format=merged / offset=0` |
+| `cn.blackradar.studio.FlashService` | 前台服务 + WakeLock + 通知，刷机时不让系统杀掉 |
+| 界面 | `BlackRadar Studio` / `Cardputer ADV` / `USB OTG` 状态 + 固件列表 |
+
+也就是说，Android 版是**用手机当 USB 烧录器**，直接跟 ESP32-S3 的 ROM bootloader 说话。
+
+**iOS 没有这条路。** 不是权限没申请，是系统层面不存在：
+
+* 第三方 App 拿不到 USB 主机接口。`UsbDeviceConnection` / `bulkTransfer` 这套 API 在 iOS 上没有对等物，`IOUSBHostFamily` 只给系统自带驱动用。
+* CDC-ACM（ESP32-S3 的 USB-Serial/JTAG）不是 MFi 配件类，没有 `ExternalAccessory` 协议字符串可用，插上只会被系统当串口吃掉，App 看不见端点。
+* 越狱环境（palera1n / Dopamine 之类）理论上能通过内核扩展拿到串口，但那是另一套东西，普通签名安装的 IPA 做不到。
+
+所以 iOS 版换了条**同样能刷成、而且更稳**的路：**让设备自己刷**。
+
+固件 2.9.1 内部自带 Web 服务（`192.168.4.1`，热点名 `BlackRadar-XXXX`，SD 根目录 `/dolphindeck/`，上传接口 `POST /upload?dir=...`），以及一个「SD 刷机」界面，读 `/update/` 下的 `firmware.bin` / `bootloader.bin` / `partitions.bin` 写 flash。
+
+于是 iOS 版的刷机流程是：
+
+1. 手机连设备热点（`BlackRadar-XXXX`）
+2. App 探测 `192.168.4.1`，读出设备页面上的目录列表
+3. App 把固件 multipart 上传到 `/upload?dir=/update`，文件名 `firmware.bin`（3.8 MB，带进度）
+4. 在 Cardputer 上进 SD 刷机界面按 `ENTER`
+5. 设备自己写 flash 并重启
+
+不依赖电脑、不依赖 OTG 线，写入由设备端的 ESP-IDF `Update`/分区写完成。**这也是唯一的正路**：任何声称在未越狱 iOS 上能 USB 线刷 ESP32 的方案都是假的。
+
+---
+
+## 二、这个 App 有什么
+
+四个 Tab，跟 Android 版对应，配色沿用设备的深色 + 金色：
+
+**固件**
+- 实时拉 `studio.json`：名称、版本、tagline、亮点、board/chip、大小、SHA-256
+- 下载带进度条，落盘 `Documents/Firmware/<id>.bin`，下完自动比 SHA-256
+- 「校验」单独再算一次（CryptoKit）
+- 「无线刷入」直接跳到设备上传
+- 「导出到文件 / SD 卡」：走系统分享，可以存进「文件」App，也可以存到读卡器里的 SD 卡
+- 右上角可导入本地 `.bin`（自己编译的固件也行），也支持下拉刷新
+- 目录会缓存一份，断网也能看到列表
+
+**设备**
+- 地址框（默认 `192.168.4.1`）+ 探测，显示设备页面标题、在线状态
+- 自动解析设备页面上的目录下拉框，点一下就切换目标目录（默认 `/update`）
+- 上传带进度，可取消；上传完直接告诉你下一步在设备上按 `ENTER`
+- 「打开 Wi-Fi 设置」一键跳到系统无线局域网
+
+**资源包**
+- `sd_packs`：密码字典、NFC 卡库、抬杆码库、红外码库（1233 个品牌型号）、蓝牙设备表
+- 下载 + SHA-256 校验，存 `Documents/Packs/`，分享出去拷进 SD 卡
+
+**说明**
+- iOS 版刷机步骤、USB 不可用的技术原因、数据来源、实时日志
+
+其它细节：
+
+- Info.plist 开了 `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace`，所以 **「文件」App → 我的 iPhone → 黑雷达 Studio** 里能直接看到下载的 `.bin`，拷进 SD 卡很顺手
+- `NSAllowsLocalNetworking` + `NSLocalNetworkUsageDescription`：http 打 `192.168.4.1` 不会被 ATS 拦，首次访问会弹本地网络授权
+- 图标是脚本画的（`mkicon.py`，纯标准库写 PNG），深色圆角底 + 金色雷达
+
+---
+
+## 三、编译 / 拿 IPA
+
+### 已经编好的
+
+`dist/BlackRadarStudio-0.1.0-unsigned.ipa`（`Payload/BlackRadarStudio.app`，arm64，iOS 17.0+，未签名）。
+
+### 自己编（macOS + Xcode 15 以上）
+
+```bash
+chmod +x build.sh
+./build.sh
+# 产物 build/BlackRadarStudio-0.1.0-unsigned.ipa
+```
+
+`build.sh` 干的事：
+
+```bash
+swiftc -sdk $(xcrun --sdk iphoneos --show-sdk-path) \
+       -target arm64-apple-ios17.0 -swift-version 5 -O -parse-as-library \
+       -module-name BlackRadarStudio -o Payload/BlackRadarStudio.app/BlackRadarStudio Sources/*.swift
+cp Info.plist Payload/BlackRadarStudio.app/
+python3 mkicon.py Payload/BlackRadarStudio.app
+zip -r BlackRadarStudio-0.1.0-unsigned.ipa Payload
+```
+
+顺手会编一份模拟器版、装进 iPhone 模拟器跑一遍并截图，确认不闪退（`SIM=0` 关掉）。
+
+### 签名安装
+
+IPA 拖进 **Sideloadly / eSign / AltStore / TrollStore**，用你自己的证书与描述文件签。
+
+- Bundle ID 默认 `com.akwkw1.blackradarstudio`，签名工具里可以改，改成你证书能用的即可
+- 免费开发者账号 7 天有效期，付费账号 1 年
+- 装不上一般是 Bundle ID 冲突、描述文件没带这台设备的 UDID，或者没给「本地网络」权限
+
+---
+
+## 四、改点东西
+
+| 想改 | 位置 |
+| --- | --- |
+| 显示名 | `Info.plist` 的 `CFBundleDisplayName` |
+| Bundle ID | `Info.plist` 的 `CFBundleIdentifier` |
+| 默认设备地址 | `Sources/Model.swift` 里 `host` 初始值 |
+| 默认目标目录 | `Sources/Model.swift` 里 `targetDir` |
+| 固件目录 URL | `Sources/Model.swift` 里 `catalogURL` |
+| 配色 | `Sources/Theme.swift` |
+| 图标 | `mkicon.py` 里的颜色/图形常量，重跑 `build.sh` |
+
+---
+
+## 五、文件结构
 
 ```
-./build.sh                                                        # macOS：Xcode 的 clang 和 SDK
-CC=xnu-clang SDK=$THEOS/sdks/iPhoneOS16.5.sdk ./build.sh          # 别的地方：能出 iOS 程序的 clang + iPhoneOS SDK
+.
+├── build.sh                 # 一条命令出未签名 IPA（含模拟器冒烟测试）
+├── Info.plist               # Bundle 配置、ATS 本地网络、文件共享
+├── mkicon.py                # 纯标准库画图标
+└── Sources
+    ├── App.swift            # @main
+    ├── Theme.swift          # 配色与卡片组件
+    ├── Net.swift            # 下载器 / multipart 上传器（带进度）
+    ├── Model.swift          # studio.json 模型、目录、下载校验、设备探测与上传
+    └── Views.swift          # 四个页面
 ```
 
-产物在 `build/SystemCheck.ipa`。装了 ldid 就用 `Entitlements.plist` 签名。没有苹果签名：给不要苹果签名就能装应用的
-iOS 用（K40 移植），或者自己重签。
+代码量约 1200 行，纯系统框架：SwiftUI、Foundation、CryptoKit、UniformTypeIdentifiers。
