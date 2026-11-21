@@ -388,7 +388,7 @@ struct DeviceView: View {
                                         .padding(.vertical, 9)
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .disabled(m.deviceProbing)
+                                .disabled(m.deviceProbing || m.scanning)
                             }
                             .tint(Theme.gold)
 
@@ -399,6 +399,25 @@ struct DeviceView: View {
                                 Text(m.deviceOnline ? (m.deviceTitle.isEmpty ? "设备在线" : m.deviceTitle) : "未连接")
                                     .font(.system(size: 12))
                                     .foregroundStyle(m.deviceOnline ? Theme.ok : Theme.sub)
+                                Spacer()
+                                Button {
+                                    Task { await m.scanDevices() }
+                                } label: {
+                                    Text(m.scanning ? "扫描中…" : "自动扫描")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Theme.gold.opacity(0.16))
+                                        .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Theme.gold)
+                                .disabled(m.scanning || m.deviceProbing)
+                            }
+                            if !m.scanFound.isEmpty {
+                                Text("扫到：" + m.scanFound.joined(separator: " / "))
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(Theme.ok)
                             }
                         }
                     }

@@ -72,6 +72,8 @@ final class AppModel: ObservableObject {
     @Published var uploadProgress: Double?
     @Published var uploadEntryID: String?
     @Published var wifiIP: String?
+    @Published var scanning = false
+    @Published var scanFound: [String] = []
 
     private var downloaders: [String: Downloader] = [:]
     private var uploader: Uploader?
@@ -117,6 +119,51 @@ final class AppModel: ObservableObject {
             if name.hasPrefix("en") { fallback = ip }
         }
         return fallback
+    }
+
+    /// 常见设备地址：设备自开热点默认 192.168.4.1；iPhone 个人热点给客户端分 172.20.10.2 起
+    nonisolated static var candidates: [String] {
+        var list = ["192.168.4.1"]
+        for i in 2...6 { list.append("172.20.10.\(i)") }
+        return list
+    }
+
+    nonisolated static func reachable(_ host: String) async -> String? {
+        guard let url = URL(string: "http://\(host)/") else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.2
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 { return host }
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    func scanDevices() async {
+        scanning = true
+        scanFound = []
+        defer { scanning = false }
+        var found: [String] = []
+        await withTaskGroup(of: String?.self) { group in
+            for c in Self.candidates {
+                group.addTask { await Self.reachable(c) }
+            }
+            for await r in group {
+                if let r, !found.contains(r) { found.append(r) }
+            }
+        }
+        scanFound = found.sorted()
+        if let first = scanFound.first {
+            host = first
+            log("扫描到设备 \(first)")
+            await probeDevice()
+        } else {
+            log("扫描没找到设备（试过 \(Self.candidates.count) 个地址）")
+            alert = "没扫到设备。\n\n确认：\n1. 手机连了设备热点（BlackRadar-XXXX），或设备已连上你的热点\n2. 设备停在 Wi-Fi/网页那一屏（退出就关无线）\n3. 关掉 VPN、代理、私密代理"
+        }
     }
 
     func refreshNet() {
