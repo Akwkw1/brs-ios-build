@@ -77,9 +77,8 @@ SwiftUI + URLSession，没有第三方依赖，编译产物是**未签名 IPA**�
 
 ## 三、编译 / 拿 IPA
 
-### 已经编好的
-
-`dist/BlackRadarStudio-0.1.0-unsigned.ipa`（`Payload/BlackRadarStudio.app`，arm64，iOS 17.0+，未签名）。
+产物是 `build/BlackRadarStudio-0.1.0-unsigned.ipa`（`Payload/BlackRadarStudio.app`，arm64，iOS 17.0+，未签名）。
+仓库的 GitHub Actions 每次 push 都会跑一遍 `build.sh` 并把 IPA 作为 artifact 上传。
 
 ### 自己编（macOS + Xcode 15 以上）
 
@@ -142,3 +141,5 @@ IPA 拖进 **Sideloadly / eSign / AltStore / TrollStore**，用你自己的证�
 ```
 
 代码量约 1200 行，纯系统框架：SwiftUI、Foundation、CryptoKit、UniformTypeIdentifiers。
+
+上传接口那部分有坑，别照 ESP-IDF 的 `file_serving` 例子写：那个例子是 `POST /upload/<文件名>` + 裸 body，黑雷达固件是 **Arduino WebServer 的 multipart**（字段 `f`、目录 `?dir=`）。对照与出处都在 [REFERENCE.md](REFERENCE.md)。

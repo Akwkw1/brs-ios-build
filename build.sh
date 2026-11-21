@@ -79,15 +79,19 @@ PY
 				xcrun simctl boot "$UDID" 2>/dev/null || true
 				xcrun simctl bootstatus "$UDID" -b 2>/dev/null || true
 				xcrun simctl install "$UDID" "$SIMAPP" || true
-				xcrun simctl launch "$UDID" "$BUNDLE_ID" || true
-				sleep 9
-				xcrun simctl io "$UDID" screenshot "$OUT/screenshot.png" || true
-				if [ -f "$OUT/screenshot.png" ]; then
-					echo "== 截图 $OUT/screenshot.png ($(wc -c < "$OUT/screenshot.png") bytes)"
-					echo "SCREENSHOT_BASE64_BEGIN"
-					python3 -c "import base64,sys;print(base64.b64encode(open(sys.argv[1],'rb').read()).decode())" "$OUT/screenshot.png"
-					echo "SCREENSHOT_BASE64_END"
-				fi
+				for T in 0 1 2 3; do
+					xcrun simctl terminate "$UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
+					xcrun simctl launch "$UDID" "$BUNDLE_ID" -tab "$T" >/dev/null 2>&1 || true
+					sleep 5
+					xcrun simctl io "$UDID" screenshot "$OUT/tab$T.png" >/dev/null 2>&1 || true
+					if [ -f "$OUT/tab$T.png" ]; then
+						sips -s format jpeg -s formatOptions 62 --resampleWidth 900 "$OUT/tab$T.png" --out "$OUT/tab$T.jpg" >/dev/null 2>&1 \
+							|| cp "$OUT/tab$T.png" "$OUT/tab$T.jpg"
+						echo "TAB${T}_SHOT_BEGIN"
+						python3 -c "import base64,sys;print(base64.b64encode(open(sys.argv[1],'rb').read()).decode())" "$OUT/tab$T.jpg"
+						echo "TAB${T}_SHOT_END"
+					fi
+				done
 				echo "== 最近崩溃报告（如果有）"
 				ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -3 || echo "无"
 			else

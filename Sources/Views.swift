@@ -5,17 +5,28 @@ import UniformTypeIdentifiers
 
 struct RootView: View {
     @EnvironmentObject var m: AppModel
+    @State private var tab = 0
 
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             FirmwareView()
                 .tabItem { Label("固件", systemImage: "antenna.radiowaves.left.and.right") }
+                .tag(0)
             DeviceView()
                 .tabItem { Label("设备", systemImage: "wifi") }
+                .tag(1)
             PacksView()
                 .tabItem { Label("资源包", systemImage: "sdcard") }
+                .tag(2)
             AboutView()
                 .tabItem { Label("说明", systemImage: "info.circle") }
+                .tag(3)
+        }
+        .onAppear {
+            let args = ProcessInfo.processInfo.arguments
+            if let i = args.firstIndex(of: "-tab"), i + 1 < args.count, let v = Int(args[i + 1]) {
+                tab = max(0, min(3, v))
+            }
         }
         .tint(Theme.gold)
         .alert("提示", isPresented: Binding(
@@ -147,6 +158,11 @@ struct FirmwareCard: View {
     let entry: FirmwareEntry
 
     private var isDownloading: Bool { m.progress[entry.id] != nil }
+
+    private func versionText(_ v: String) -> String {
+        if let c = v.first, c == "v" || c == "V" || c.isLetter { return v }
+        return "v" + v
+    }
     private var local: LocalFile? { m.localFile(for: entry.id) }
 
     var body: some View {
@@ -156,7 +172,7 @@ struct FirmwareCard: View {
                     Text(entry.name)
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(Theme.text)
-                    Pill(text: "v\(entry.version)", color: Theme.gold)
+                    Pill(text: versionText(entry.version), color: Theme.gold)
                     if let board = entry.board {
                         Pill(text: board)
                     }
