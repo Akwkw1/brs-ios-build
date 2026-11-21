@@ -549,7 +549,7 @@ final class AppModel: ObservableObject {
 
     // MARK: 小工具
 
-    static func firstMatch(_ text: String, pattern: String) -> String? {
+    nonisolated static func firstMatch(_ text: String, pattern: String) -> String? {
         guard let re = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else { return nil }
         let ns = text as NSString
         guard let m = re.firstMatch(in: text, options: [], range: NSRange(location: 0, length: ns.length)),
@@ -557,7 +557,7 @@ final class AppModel: ObservableObject {
         return ns.substring(with: m.range(at: 1))
     }
 
-    static func allMatches(_ text: String, pattern: String) -> [String] {
+    nonisolated static func allMatches(_ text: String, pattern: String) -> [String] {
         guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
         let ns = text as NSString
         var out: [String] = []
@@ -570,7 +570,7 @@ final class AppModel: ObservableObject {
         return out
     }
 
-    static func sizeText(_ bytes: Int64) -> String {
+    nonisolated static func sizeText(_ bytes: Int64) -> String {
         if bytes <= 0 { return "—" }
         let f = ByteCountFormatter()
         f.countStyle = .file
